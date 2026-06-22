@@ -47,8 +47,8 @@
 <main>
   <label id="drop">
     <input type="file" id="file" accept=".pdf,.png,.jpg,.jpeg,.bmp" multiple>
-    <div><b>Drop CTG files here</b> or click to choose &mdash; one or many, PDF / PNG / JPG</div>
-    <div class="muted" style="margin-top:6px;">For bulk, select many at once (Ctrl/Cmd+A in the file dialog).</div>
+    <div><b>Drop CTG files or a folder here</b> or click to choose &mdash; one or many, PDF / PNG / JPG</div>
+    <div class="muted" style="margin-top:6px;">For bulk, drop a whole folder, or select many at once (Ctrl/Cmd+A in the file dialog).</div>
   </label>
 
   <div class="opts">
@@ -84,9 +84,33 @@
 
   function mode() { return document.querySelector('input[name=mode]:checked').value; }
 
+  // Recursively collect accepted files from a dropped FileSystemEntry (file or folder).
+  var ACCEPT = /\.(pdf|png|jpe?g|bmp)$/i;
+  function entryFiles(entry, out) {
+    return new Promise(function (resolve) {
+      if (entry.isFile) { entry.file(function (f) { if (ACCEPT.test(f.name)) out.push(f); resolve(); }, function () { resolve(); }); }
+      else if (entry.isDirectory) {
+        var rd = entry.createReader(), acc = [];
+        (function next() { rd.readEntries(function (b) {  // readEntries yields at most ~100 per call
+          if (!b.length) { Promise.all(acc.map(function (e) { return entryFiles(e, out); })).then(resolve); }
+          else { acc = acc.concat(Array.prototype.slice.call(b)); next(); }
+        }, function () { resolve(); }); })();
+      } else { resolve(); }
+    });
+  }
+  // Expand a drop into a flat, name-sorted File[] — supports dropped folders, falls back to dataTransfer.files.
+  function filesFromDrop(dt) {
+    var items = dt.items, ents = [];
+    if (items && items.length && items[0].webkitGetAsEntry) {
+      for (var i = 0; i < items.length; i++) { var e = items[i].webkitGetAsEntry(); if (e) ents.push(e); }  // must be called sync
+    }
+    if (ents.length) { var out = []; return Promise.all(ents.map(function (e) { return entryFiles(e, out); })).then(function () { out.sort(function (a, b) { return a.name < b.name ? -1 : 1; }); return out; }); }
+    return Promise.resolve(Array.prototype.slice.call(dt.files).filter(function (f) { return ACCEPT.test(f.name); }));
+  }
+
   drop.addEventListener("dragover", function (e) { e.preventDefault(); drop.classList.add("hover"); });
   drop.addEventListener("dragleave", function () { drop.classList.remove("hover"); });
-  drop.addEventListener("drop", function (e) { e.preventDefault(); drop.classList.remove("hover"); if (e.dataTransfer.files.length) handleFiles(e.dataTransfer.files); });
+  drop.addEventListener("drop", function (e) { e.preventDefault(); drop.classList.remove("hover"); filesFromDrop(e.dataTransfer).then(function (files) { if (files.length) handleFiles(files); }); });
   fileInput.addEventListener("change", function () { if (fileInput.files.length) handleFiles(fileInput.files); });
   $("clear").addEventListener("click", function () { processed = []; results.innerHTML = ""; bar.classList.add("hidden"); fileInput.value = ""; dlzip.disabled = true; });
 
