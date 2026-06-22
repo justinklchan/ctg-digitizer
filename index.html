@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CTG Digitizer</title>
+<style>
+  :root { --fg:#1c2330; --muted:#5b6472; --line:#d7dce3; --accent:#2c5ac8; --bg:#f6f7f9; --ok:#16653a; --warn:#9a6700; --bad:#b00020; }
+  * { box-sizing:border-box; }
+  body { font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; color:var(--fg); margin:0; background:var(--bg); line-height:1.45; }
+  header { background:#fff; border-bottom:1px solid var(--line); padding:16px 24px; }
+  h1 { font-size:19px; margin:0 0 4px; }
+  .sub { color:var(--muted); font-size:13px; }
+  .privacy { color:var(--ok); background:#e7f6ec; border:1px solid #bfe3cc; border-radius:6px; padding:6px 10px; font-size:12.5px; display:inline-block; margin-top:8px; }
+  main { max-width:1100px; margin:0 auto; padding:20px 24px 60px; }
+  #drop { background:#fff; border:2px dashed var(--line); border-radius:10px; padding:30px; text-align:center; color:var(--muted); cursor:pointer; transition:.15s; }
+  #drop.hover { border-color:var(--accent); background:#eef3fd; color:var(--fg); }
+  #drop b { color:var(--fg); }
+  #drop input { display:none; }
+  .opts { display:flex; gap:18px; align-items:center; flex-wrap:wrap; margin:14px 2px 0; font-size:13px; color:var(--muted); }
+  .opts label { cursor:pointer; }
+  .bar { display:flex; align-items:center; gap:14px; flex-wrap:wrap; margin:16px 0 4px; }
+  button { font:inherit; background:var(--accent); color:#fff; border:0; border-radius:6px; padding:9px 16px; cursor:pointer; font-weight:600; }
+  button:disabled { background:#9fb0d6; cursor:default; }
+  button.sec { background:#fff; color:var(--fg); border:1px solid var(--line); }
+  .muted { color:var(--muted); font-size:12.5px; }
+  .hidden { display:none; }
+  .card { background:#fff; border:1px solid var(--line); border-radius:8px; padding:14px 16px; margin-bottom:14px; }
+  .card h3 { margin:0 0 4px; font-size:14px; }
+  .badges { display:flex; gap:8px; flex-wrap:wrap; margin:2px 0 10px; }
+  .badge { font-size:11.5px; padding:2px 8px; border-radius:20px; border:1px solid var(--line); }
+  .badge.ok { color:var(--ok); background:#e7f6ec; border-color:#bfe3cc; }
+  .badge.warn { color:var(--warn); background:#fff6e0; border-color:#f0dca0; }
+  .badge.bad { color:var(--bad); background:#fdecef; border-color:#f3c0ca; }
+  canvas { max-width:100%; height:auto; border:1px solid var(--line); border-radius:6px; display:block; }
+  a.dl { font-size:12.5px; color:var(--accent); text-decoration:none; font-weight:600; }
+  details summary { cursor:pointer; font-size:12.5px; color:var(--muted); }
+  pre.log { background:#0f1626; color:#cfe3ff; padding:10px 12px; border-radius:6px; font-size:11.5px; white-space:pre-wrap; margin:8px 0 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>CTG Digitizer</h1>
+  <div class="sub">Drop cardiotocography strips (PDF or image) &mdash; each is digitized automatically into a CSV time series. Traces are separated by panel; the axis scale is read off the strip.</div>
+  <div class="privacy">&#128274; Runs entirely in your browser. Your strips are never uploaded &mdash; only this page's code is downloaded, the images stay on your computer.</div>
+</header>
+<main>
+  <label id="drop">
+    <input type="file" id="file" accept=".pdf,.png,.jpg,.jpeg,.bmp" multiple>
+    <div><b>Drop CTG files here</b> or click to choose &mdash; one or many, PDF / PNG / JPG</div>
+    <div class="muted" style="margin-top:6px;">For bulk, select many at once (Ctrl/Cmd+A in the file dialog).</div>
+  </label>
+
+  <div class="opts">
+    <span>Axis scale:</span>
+    <label><input type="radio" name="mode" value="ocr" checked> Auto-detect (read numbers off the strip)</label>
+    <label><input type="radio" name="mode" value="standard"> Standard (240/30 bpm, 0&ndash;100 TOCO) &mdash; faster</label>
+  </div>
+
+  <div class="bar hidden" id="bar">
+    <button id="dlzip" disabled>&#8681; Download all CSVs (ZIP)</button>
+    <button id="clear" class="sec">Clear</button>
+    <span class="muted" id="progress"></span>
+  </div>
+
+  <div id="results"></div>
+
+  <div class="muted" style="margin-top:18px;">Auto-detect reads the printed axis numbers (OCR) and falls back to the standard scale per-axis when a strip's labels can't be read reliably &mdash; the badges on each result say which was used. The red dots show the extracted trace; check they sit on the lines.</div>
+</main>
+
+<script src="vendor/pdf.min.js"></script>
+<script src="vendor/jszip.min.js"></script>
+<script src="vendor/tesseract/tesseract.min.js"></script>
+<script src="digitizer_core.js"></script>
+<script src="autocal.js"></script>
+<script>
+"use strict";
+(function () {
+  pdfjsLib.GlobalWorkerOptions.workerSrc = "vendor/pdf.worker.min.js";
+  var $ = function (id) { return document.getElementById(id); };
+  var fileInput = $("file"), drop = $("drop"), results = $("results");
+  var dlzip = $("dlzip"), bar = $("bar"), progress = $("progress");
+  var processed = [], MAXW = 1100, S = 5, tessWorker = null;
+
+  function mode() { return document.querySelector('input[name=mode]:checked').value; }
+
+  drop.addEventListener("dragover", function (e) { e.preventDefault(); drop.classList.add("hover"); });
+  drop.addEventListener("dragleave", function () { drop.classList.remove("hover"); });
+  drop.addEventListener("drop", function (e) { e.preventDefault(); drop.classList.remove("hover"); if (e.dataTransfer.files.length) handleFiles(e.dataTransfer.files); });
+  fileInput.addEventListener("change", function () { if (fileInput.files.length) handleFiles(fileInput.files); });
+  $("clear").addEventListener("click", function () { processed = []; results.innerHTML = ""; bar.classList.add("hidden"); fileInput.value = ""; dlzip.disabled = true; });
+
+  function readFile(file, asBuffer) {
+    return new Promise(function (res, rej) { var r = new FileReader(); r.onload = function () { res(r.result); }; r.onerror = function () { rej(new Error("could not read " + file.name)); }; if (asBuffer) r.readAsArrayBuffer(file); else r.readAsDataURL(file); });
+  }
+  function loadImage(u) { return new Promise(function (res, rej) { var im = new Image(); im.onload = function () { res(im); }; im.onerror = function () { rej(new Error("bad image")); }; im.src = u; }); }
+  function imgToCanvas(im) { var cv = document.createElement("canvas"); cv.width = im.naturalWidth; cv.height = im.naturalHeight; cv.getContext("2d", { willReadFrequently: true }).drawImage(im, 0, 0); return cv; }
+  function pdfPageToCanvas(page, scale) {
+    var vp = page.getViewport({ scale: scale }); var cv = document.createElement("canvas"); cv.width = Math.round(vp.width); cv.height = Math.round(vp.height);
+    var ctx = cv.getContext("2d", { willReadFrequently: true }); ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, cv.width, cv.height);
+    return page.render({ canvasContext: ctx, viewport: vp }).promise.then(function () { return cv; });
+  }
+  function unitsFromFile(file) {
+    var stem = file.name.replace(/\.[^.]+$/, "") || "ctg", ext = (file.name.split(".").pop() || "").toLowerCase();
+    if (ext === "pdf") {
+      return readFile(file, true).then(function (buf) {
+        return pdfjsLib.getDocument({ data: new Uint8Array(buf) }).promise.then(function (pdf) {
+          var units = [], chain = Promise.resolve();
+          for (var p = 1; p <= pdf.numPages; p++) (function (pn) {
+            chain = chain.then(function () { return pdf.getPage(pn).then(function (pg) { return pdfPageToCanvas(pg, 2); }).then(function (cv) { units.push({ label: file.name + (pdf.numPages > 1 ? " — page " + pn : ""), csvStem: stem + (pdf.numPages > 1 ? "_p" + pn : ""), canvas: cv }); }); });
+          })(p);
+          return chain.then(function () { return units; });
+        });
+      });
+    }
+    return readFile(file, false).then(loadImage).then(function (im) { return [{ label: file.name, csvStem: stem, canvas: imgToCanvas(im) }]; });
+  }
+
+  // --- OCR auto-calibration ---
+  function getWorker() {
+    if (tessWorker) return tessWorker;
+    tessWorker = Tesseract.createWorker("eng", 1, {
+      workerPath: "vendor/tesseract/worker.min.js",
+      corePath: "vendor/tesseract/",
+      langPath: "vendor/tesseract/",
+    });
+    return tessWorker;
+  }
+  function binarizeCrop(src, x0, x1, y0, y1) {
+    var cw = x1 - x0, ch = y1 - y0;
+    var sm = document.createElement("canvas"); sm.width = cw; sm.height = ch;
+    var sx = sm.getContext("2d", { willReadFrequently: true }); sx.drawImage(src, x0, y0, cw, ch, 0, 0, cw, ch);
+    var id = sx.getImageData(0, 0, cw, ch), px = id.data;
+    for (var i = 0; i < px.length; i += 4) { var mx = Math.max(px[i], px[i + 1], px[i + 2]); var v = mx < 130 ? 0 : 255; px[i] = px[i + 1] = px[i + 2] = v; px[i + 3] = 255; }
+    sx.putImageData(id, 0, 0);
+    var big = document.createElement("canvas"); big.width = cw * S; big.height = ch * S;
+    var bx = big.getContext("2d"); bx.imageSmoothingEnabled = true; bx.drawImage(sm, 0, 0, big.width, big.height);
+    return big;
+  }
+  function ocrCalibrate(data, W, H, src) {
+    var grid = CTGDigitizer._internal.detectGridlines(data, W, H);
+    if (grid.rows.length < 4 || grid.cols.length < 2) return Promise.resolve(null);
+    var pan = CTGDigitizer._internal.splitPanels(grid.rows);
+    var lw = Math.round(0.15 * W), pad = Math.max(20, Math.round(0.04 * H));
+    return getWorker().then(function (w) {
+      function ocr(cv, wl, psm) { return w.setParameters({ tessedit_char_whitelist: wl, tessedit_pageseg_mode: psm }).then(function () { return w.recognize(cv); }).then(function (r) { return r.data.words; }); }
+      var by0 = Math.max(0, Math.round(pan.boundary - pad)), by1 = Math.min(H, Math.round(pan.boundary + pad));
+      return ocr(binarizeCrop(src, 0, lw, 0, H), "0123456789", "6").then(function (L) {
+        return ocr(binarizeCrop(src, W - lw, W, 0, H), "0123456789", "6").then(function (R) {
+          return ocr(binarizeCrop(src, 0, W, by0, by1), "0123456789:", "11").then(function (T) {
+            var yTokens = [];
+            L.concat(R).forEach(function (t) { var s = t.text.trim(); if (/^\d{1,3}$/.test(s)) yTokens.push({ val: +s, y: (t.bbox.y0 + t.bbox.y1) / 2 / S }); });
+            var timeTokens = T.map(function (t) { return { text: t.text.trim(), x: (t.bbox.x0 + t.bbox.x1) / 2 / S }; }).filter(function (t) { return /^\d{1,3}$|^\d{1,2}:\d{2}$/.test(t.text); });
+            return CTGAutoCal.buildCalibration({ hrows: grid.rows, vcols: grid.cols, W: W, H: H, yTokens: yTokens, timeTokens: timeTokens });
+          });
+        });
+      });
+    });
+  }
+
+  function digitizeUnit(unit, cal) {
+    var w = unit.canvas.width, h = unit.canvas.height;
+    var data = unit.canvas.getContext("2d", { willReadFrequently: true }).getImageData(0, 0, w, h).data;
+    var opts = cal ? { fhr_cal: cal.fhr_cal, toco_cal: cal.toco_cal, start_min: cal.start_min, end_min: cal.end_min } : {};
+    return { res: CTGDigitizer.digitize(data, w, h, opts), data: data };
+  }
+
+  function uniqueName(stem) { var name = stem + "_ctg.csv", i = 2, taken = {}; processed.forEach(function (p) { taken[p.csvName] = 1; }); while (taken[name]) { name = stem + "_" + i + "_ctg.csv"; i++; } return name; }
+
+  function badge(text, cls) { var b = document.createElement("span"); b.className = "badge " + cls; b.textContent = text; return b; }
+
+  function renderCard(unit, out, cal, err) {
+    var card = document.createElement("div"); card.className = "card";
+    var h3 = document.createElement("h3"); h3.textContent = unit.label; card.appendChild(h3);
+    if (err) { var e = document.createElement("div"); e.className = "badges"; e.appendChild(badge("could not digitize: " + err.message, "bad")); card.appendChild(e); results.appendChild(card); return; }
+    var res = out.res;
+
+    var badges = document.createElement("div"); badges.className = "badges";
+    badges.appendChild(badge(res.nrows + " rows", "ok"));
+    badges.appendChild(badge(res.present.join(", "), "ok"));
+    var fs = res.calibration.fhr.source, ts = res.calibration.toco.source;
+    function scaleBadge(name, c) { return badge(name + " scale: " + (c.source === "ocr" ? "read from strip" : "standard (fallback)"), c.source === "ocr" ? "ok" : "warn"); }
+    badges.appendChild(scaleBadge("FHR", res.calibration.fhr));
+    badges.appendChild(scaleBadge("TOCO", res.calibration.toco));
+    var tmin = res.calibration.time.end_min;
+    badges.appendChild(badge("span " + (tmin ? tmin.toFixed(1) + " min" : "?"), "ok"));
+    card.appendChild(badges);
+
+    var w = unit.canvas.width, h = unit.canvas.height, s = Math.min(1, MAXW / w);
+    var disp = document.createElement("canvas"); disp.width = Math.round(w * s); disp.height = Math.round(h * s);
+    var dctx = disp.getContext("2d"); dctx.drawImage(unit.canvas, 0, 0, disp.width, disp.height); dctx.fillStyle = "#e8000b";
+    for (var k = 0; k < res.present.length; k++) { var ov = res.overlay[res.present[k]]; for (var j = 0; j < ov.cols.length; j++) dctx.fillRect(ov.cols[j] * s, (ov.rows[j] - 5) * s, Math.max(1, s), Math.max(1.3, 1.6 * s)); }
+    card.appendChild(disp);
+
+    var name = uniqueName(unit.csvStem); processed.push({ csvName: name, csv: res.csv });
+    var row = document.createElement("div"); row.style.marginTop = "8px";
+    var a = document.createElement("a"); a.className = "dl"; a.href = "#"; a.textContent = "↓ download " + name;
+    a.addEventListener("click", function (e) { e.preventDefault(); saveCsv(name, res.csv); }); row.appendChild(a); card.appendChild(row);
+
+    var det = document.createElement("details"); var sum = document.createElement("summary"); sum.textContent = "calibration details"; det.appendChild(sum);
+    var pre = document.createElement("pre"); pre.className = "log";
+    var txt = res.log.join("\n"); if (cal && cal.warnings && cal.warnings.length) txt += "\n\nOCR notes:\n  " + cal.warnings.join("\n  ");
+    pre.textContent = txt; det.appendChild(pre); card.appendChild(det);
+    results.appendChild(card);
+  }
+
+  function saveCsv(name, text) { var b = new Blob([text], { type: "text/csv" }); var a = document.createElement("a"); a.href = URL.createObjectURL(b); a.download = name; document.body.appendChild(a); a.click(); document.body.removeChild(a); setTimeout(function () { URL.revokeObjectURL(a.href); }, 1000); }
+  var yield_ = function () { return new Promise(function (r) { setTimeout(r, 0); }); };
+
+  function handleFiles(fileList) {
+    bar.classList.remove("hidden"); dlzip.disabled = true;
+    var files = Array.prototype.slice.call(fileList), done = 0, total = files.length, useOcr = mode() === "ocr";
+    progress.textContent = useOcr ? "processing (auto-detect scale)…" : "processing…";
+    var chain = Promise.resolve();
+    files.forEach(function (file) {
+      chain = chain.then(function () {
+        return unitsFromFile(file).then(function (units) {
+          var c = Promise.resolve();
+          units.forEach(function (unit) {
+            c = c.then(yield_).then(function () {
+              var w = unit.canvas.width, h = unit.canvas.height;
+              var data = unit.canvas.getContext("2d", { willReadFrequently: true }).getImageData(0, 0, w, h).data;
+              var calP = useOcr ? ocrCalibrate(data, w, h, unit.canvas).catch(function () { return null; }) : Promise.resolve(null);
+              return calP.then(function (cal) {
+                var out; try { out = { res: CTGDigitizer.digitize(data, w, h, cal ? { fhr_cal: cal.fhr_cal, toco_cal: cal.toco_cal, start_min: cal.start_min, end_min: cal.end_min } : {}) }; } catch (e) { renderCard(unit, null, cal, e); return; }
+                renderCard(unit, out, cal, null);
+              });
+            });
+          });
+          return c;
+        }).catch(function (e) { renderCard({ label: file.name, csvStem: "x", canvas: document.createElement("canvas") }, null, null, e); }).then(function () { done++; progress.textContent = "processed " + done + " / " + total + " file(s)"; });
+      });
+    });
+    chain.then(function () { var ok = processed.length; progress.textContent = "done · " + ok + " CSV" + (ok === 1 ? "" : "s") + " ready" + (done < total ? " (" + (total - done) + " file errors)" : ""); dlzip.disabled = ok === 0; });
+  }
+
+  dlzip.addEventListener("click", function () {
+    if (!processed.length) return; var zip = new JSZip(); processed.forEach(function (p) { zip.file(p.csvName, p.csv); });
+    dlzip.disabled = true; dlzip.textContent = "zipping…";
+    zip.generateAsync({ type: "blob", compression: "DEFLATE" }).then(function (blob) {
+      var a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "ctg_csvs.zip"; document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      setTimeout(function () { URL.revokeObjectURL(a.href); }, 2000); dlzip.disabled = false; dlzip.innerHTML = "↓ Download all CSVs (ZIP)";
+    });
+  });
+})();
+</script>
+</body>
+</html>
