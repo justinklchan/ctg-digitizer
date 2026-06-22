@@ -20,6 +20,8 @@
   .opts { display:flex; gap:18px; align-items:center; flex-wrap:wrap; margin:14px 2px 0; font-size:13px; color:var(--muted); }
   .opts label { cursor:pointer; }
   .bar { display:flex; align-items:center; gap:14px; flex-wrap:wrap; margin:16px 0 4px; }
+  .pbar { flex:0 0 200px; height:8px; background:#e6e9ef; border-radius:999px; overflow:hidden; }
+  .pbar > i { display:block; height:100%; width:0; background:var(--accent); border-radius:999px; transition:width .2s ease; }
   button { font:inherit; background:var(--accent); color:#fff; border:0; border-radius:6px; padding:9px 16px; cursor:pointer; font-weight:600; }
   button:disabled { background:#9fb0d6; cursor:default; }
   button.sec { background:#fff; color:var(--fg); border:1px solid var(--line); }
@@ -60,6 +62,7 @@
   <div class="bar hidden" id="bar">
     <button id="dlzip" disabled>&#8681; Download all CSVs (ZIP)</button>
     <button id="clear" class="sec">Clear</button>
+    <div class="pbar hidden" id="pbar"><i></i></div>
     <span class="muted" id="progress"></span>
   </div>
 
@@ -79,7 +82,8 @@
   pdfjsLib.GlobalWorkerOptions.workerSrc = "vendor/pdf.worker.min.js";
   var $ = function (id) { return document.getElementById(id); };
   var fileInput = $("file"), drop = $("drop"), results = $("results");
-  var dlzip = $("dlzip"), bar = $("bar"), progress = $("progress");
+  var dlzip = $("dlzip"), bar = $("bar"), progress = $("progress"), pbar = $("pbar");
+  function setProgress(done, total) { pbar.classList.toggle("hidden", total <= 1); pbar.firstChild.style.width = total ? Math.round(done / total * 100) + "%" : "0"; }
   var processed = [], MAXW = 1100, S = 5, tessWorker = null;
 
   function mode() { return document.querySelector('input[name=mode]:checked').value; }
@@ -112,7 +116,7 @@
   drop.addEventListener("dragleave", function () { drop.classList.remove("hover"); });
   drop.addEventListener("drop", function (e) { e.preventDefault(); drop.classList.remove("hover"); filesFromDrop(e.dataTransfer).then(function (files) { if (files.length) handleFiles(files); }); });
   fileInput.addEventListener("change", function () { if (fileInput.files.length) handleFiles(fileInput.files); });
-  $("clear").addEventListener("click", function () { processed = []; results.innerHTML = ""; bar.classList.add("hidden"); fileInput.value = ""; dlzip.disabled = true; });
+  $("clear").addEventListener("click", function () { processed = []; results.innerHTML = ""; bar.classList.add("hidden"); pbar.classList.add("hidden"); fileInput.value = ""; dlzip.disabled = true; });
 
   function readFile(file, asBuffer) {
     return new Promise(function (res, rej) { var r = new FileReader(); r.onload = function () { res(r.result); }; r.onerror = function () { rej(new Error("could not read " + file.name)); }; if (asBuffer) r.readAsArrayBuffer(file); else r.readAsDataURL(file); });
@@ -196,7 +200,7 @@
   function renderCard(unit, out, cal, err) {
     var card = document.createElement("div"); card.className = "card";
     var h3 = document.createElement("h3"); h3.textContent = unit.label; card.appendChild(h3);
-    if (err) { var e = document.createElement("div"); e.className = "badges"; e.appendChild(badge("could not digitize: " + err.message, "bad")); card.appendChild(e); results.appendChild(card); return; }
+    if (err) { var e = document.createElement("div"); e.className = "badges"; e.appendChild(badge("could not digitize: " + err.message, "bad")); card.appendChild(e); results.insertBefore(card, results.firstChild); return; }
     var res = out.res;
 
     var badges = document.createElement("div"); badges.className = "badges";
@@ -225,7 +229,7 @@
     var pre = document.createElement("pre"); pre.className = "log";
     var txt = res.log.join("\n"); if (cal && cal.warnings && cal.warnings.length) txt += "\n\nOCR notes:\n  " + cal.warnings.join("\n  ");
     pre.textContent = txt; det.appendChild(pre); card.appendChild(det);
-    results.appendChild(card);
+    results.insertBefore(card, results.firstChild);
   }
 
   function saveCsv(name, text) { var b = new Blob([text], { type: "text/csv" }); var a = document.createElement("a"); a.href = URL.createObjectURL(b); a.download = name; document.body.appendChild(a); a.click(); document.body.removeChild(a); setTimeout(function () { URL.revokeObjectURL(a.href); }, 1000); }
@@ -234,6 +238,7 @@
   function handleFiles(fileList) {
     bar.classList.remove("hidden"); dlzip.disabled = true;
     var files = Array.prototype.slice.call(fileList), done = 0, total = files.length, useOcr = mode() === "ocr";
+    setProgress(0, total);
     progress.textContent = useOcr ? "processing (auto-detect scale)…" : "processing…";
     var chain = Promise.resolve();
     files.forEach(function (file) {
@@ -252,7 +257,7 @@
             });
           });
           return c;
-        }).catch(function (e) { renderCard({ label: file.name, csvStem: "x", canvas: document.createElement("canvas") }, null, null, e); }).then(function () { done++; progress.textContent = "processed " + done + " / " + total + " file(s)"; });
+        }).catch(function (e) { renderCard({ label: file.name, csvStem: "x", canvas: document.createElement("canvas") }, null, null, e); }).then(function () { done++; setProgress(done, total); progress.textContent = "processed " + done + " / " + total + " file(s)"; });
       });
     });
     chain.then(function () { var ok = processed.length; progress.textContent = "done · " + ok + " CSV" + (ok === 1 ? "" : "s") + " ready" + (done < total ? " (" + (total - done) + " file errors)" : ""); dlzip.disabled = ok === 0; });
