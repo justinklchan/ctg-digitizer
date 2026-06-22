@@ -124,74 +124,145 @@
     return { cols: cols, rows: rows };
   }
 
-  // peaks in a circular hue histogram -> up to maxTraces center hues
-  function findHuePeaks(hist, maxTraces) {
-    const HB = hist.length; let mx = 0;
-    for (let i = 0; i < HB; i++) if (hist[i] > mx) mx = hist[i];
-    if (mx <= 0) return [];
-    const thr = mx * 0.12;
-    const above = new Uint8Array(HB);
-    for (let i = 0; i < HB; i++) above[i] = hist[i] >= thr ? 1 : 0;
-    // circular contiguous regions
-    let start = 0; while (start < HB && above[start]) start++;
-    if (start === HB) start = 0;                       // all above -> one region
-    const regions = []; let cur = null;
-    for (let s = 0; s < HB; s++) {
-      const i = (start + s) % HB;
-      if (above[i]) { if (!cur) cur = []; cur.push(i); }
-      else if (cur) { regions.push(cur); cur = null; }
-    }
-    if (cur) regions.push(cur);
-    const binW = 360 / HB;
-    const peaks = regions.map(function (reg) {
-      let m = 0, sx = 0, sy = 0;
-      for (let k = 0; k < reg.length; k++) {
-        const ang = (reg[k] + 0.5) * binW * Math.PI / 180, w = hist[reg[k]];
-        m += w; sx += w * Math.cos(ang); sy += w * Math.sin(ang);
+  // --- per-row "ink" (saturated = colored trace) count over [lo,hi], lightly smoothed ---
+  function rowInkProfile(d, W, H, sat, lo, hi) {
+    const prof = new Float64Array(H);
+    for (let y = lo; y <= hi; y++) {
+      let off = y * W * 4, c = 0;
+      for (let x = 0; x < W; x++, off += 4) {
+        const r = d[off], g = d[off + 1], b = d[off + 2];
+        const mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
+        const mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
+        if (mx - mn >= sat) c++;
       }
-      let h = Math.atan2(sy, sx) * 180 / Math.PI; if (h < 0) h += 360;
-      return { hue: h, mass: m };
-    });
-    peaks.sort(function (a, b) { return b.mass - a.mass; });
-    return peaks.slice(0, maxTraces).map(function (p) { return p.hue; });
+      prof[y] = c;
+    }
+    const sm = new Float64Array(H), win = 3;
+    for (let y = lo; y <= hi; y++) {
+      let s = 0, n = 0;
+      for (let k = -win; k <= win; k++) { const yy = y + k; if (yy >= lo && yy <= hi) { s += prof[yy]; n++; } }
+      sm[y] = s / n;
+    }
+    return sm;
   }
 
-  // colored traces within a row band, clustered by hue
-  function extractPanelTraces(d, W, H, sat, rTop, rBot, maxTraces) {
-    const HB = 36, hist = new Float64Array(HB);
+  // Center of the widest *interior* low-ink band in [lo,hi] -- a gap that has trace ink both
+  // above and below it. This separates stacked traces / panels by POSITION, not color, and
+  // (being ink-free) never cuts through a trace. Returns null when there is only one ink
+  // band (e.g. a single FHR trace with no maternal, or a single panel).
+  function widestInteriorGap(sm, lo, hi) {
+    let mx = 0; for (let y = lo; y <= hi; y++) if (sm[y] > mx) mx = sm[y];
+    if (mx <= 0) return null;
+    const low = 0.10 * mx;
+    const runs = []; let s = -1;
+    for (let y = lo; y <= hi; y++) {
+      if (sm[y] < low) { if (s < 0) s = y; }
+      else if (s >= 0) { runs.push([s, y - 1]); s = -1; }
+    }
+    if (s >= 0) runs.push([s, hi]);
+    let best = null, bestW = -1;
+    for (let i = 0; i < runs.length; i++) {
+      const a = runs[i][0], b = runs[i][1];
+      if (a <= lo || b >= hi) continue;            // touches an edge -> outer margin, not interior
+      const w = b - a; if (w > bestW) { bestW = w; best = runs[i]; }
+    }
+    return best ? Math.round((best[0] + best[1]) / 2) : null;
+  }
+
+  // ink mask (saturated pixels) within a row band
+  function inkMaskBand(d, W, H, sat, rTop, rBot) {
     const y0 = Math.max(0, Math.floor(rTop)), y1 = Math.min(H, Math.ceil(rBot));
+    const m = new Uint8Array(W * H);
     for (let y = y0; y < y1; y++) {
       let off = y * W * 4;
       for (let x = 0; x < W; x++, off += 4) {
         const r = d[off], g = d[off + 1], b = d[off + 2];
         const mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
         const mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
-        if (mx - mn < sat) continue;
-        const h = hueOf(r, g, b); if (h < 0) continue;
-        hist[Math.min(HB - 1, Math.floor(h / (360 / HB)))] += 1;
+        if (mx - mn >= sat) m[y * W + x] = 1;
       }
     }
-    const peaks = findHuePeaks(hist, maxTraces);
-    if (!peaks.length) return [];
-    const WINDOW = 25;
-    const masks = peaks.map(function () { return new Uint8Array(W * H); });
-    const counts = new Array(peaks.length).fill(0);
-    for (let y = y0; y < y1; y++) {
-      let off = y * W * 4;
-      for (let x = 0; x < W; x++, off += 4) {
+    return m;
+  }
+
+  // mean hue over a mask's set pixels -- for display/logging only, never to classify a trace
+  function meanHue(d, mask) {
+    let sx = 0, sy = 0, n = 0;
+    for (let i = 0; i < mask.length; i++) {
+      if (!mask[i]) continue;
+      const off = i * 4, h = hueOf(d[off], d[off + 1], d[off + 2]);
+      if (h < 0) continue;
+      const a = h * Math.PI / 180; sx += Math.cos(a); sy += Math.sin(a); n++;
+    }
+    if (!n) return 0;
+    let h = Math.atan2(sy, sx) * 180 / Math.PI; if (h < 0) h += 360;
+    return Math.round(h);
+  }
+
+  // mean hue sampled along a trace's points (display only)
+  function meanHueAlong(d, W, tr) {
+    let sx = 0, sy = 0, n = 0;
+    for (let j = 0; j < tr.cols.length; j++) {
+      const off = (Math.round(tr.rows[j]) * W + tr.cols[j]) * 4;
+      const h = hueOf(d[off], d[off + 1], d[off + 2]); if (h < 0) continue;
+      const a = h * Math.PI / 180; sx += Math.cos(a); sy += Math.sin(a); n++;
+    }
+    if (!n) return 0;
+    let h = Math.atan2(sy, sx) * 180 / Math.PI; if (h < 0) h += 360;
+    return Math.round(h);
+  }
+
+  // Separate two stacked traces (upper = fetal, lower = maternal) by per-column ORDER:
+  // where a column has two ink runs the topmost is fetal and the bottommost is maternal
+  // (holds unless the traces truly cross), so a fetal deceleration that dips toward the
+  // maternal line is still kept as fetal. A column with a single run is assigned by which
+  // side of splitRow it falls on, and the other trace simply gets no point there -- so a
+  // missing or absent maternal trace is preserved rather than fabricated.
+  function extractStacked(d, W, H, sat, rTop, rBot, scan_left, scan_right, splitRow) {
+    const y0 = Math.max(0, Math.floor(rTop)), y1 = Math.min(H, Math.ceil(rBot));
+    // pass 1: raw vertical ink runs per column (split at any gap > 2 px) + thickness stats
+    const colRaw = [], allTh = [];
+    for (let c = scan_left; c < scan_right; c++) {
+      const tops = [], bots = [];
+      let s = -1, last = -10;
+      for (let y = y0; y < y1; y++) {
+        const off = (y * W + c) * 4;
         const r = d[off], g = d[off + 1], b = d[off + 2];
         const mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
         const mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
-        if (mx - mn < sat) continue;
-        const h = hueOf(r, g, b); if (h < 0) continue;
-        let bi = -1, bd = 1e9;
-        for (let k = 0; k < peaks.length; k++) { const dd = circDist(h, peaks[k]); if (dd < bd) { bd = dd; bi = k; } }
-        if (bd <= WINDOW) { masks[bi][y * W + x] = 1; counts[bi]++; }
+        if (mx - mn >= sat) {
+          if (s < 0) s = y;
+          else if (y - last > 2) { tops.push(s); bots.push(last); allTh.push(last - s + 1); s = y; }
+          last = y;
+        }
       }
+      if (s >= 0) { tops.push(s); bots.push(last); allTh.push(last - s + 1); }
+      colRaw.push({ tops: tops, bots: bots });
     }
-    const out = [];
-    for (let k = 0; k < peaks.length; k++) if (counts[k] > 0) out.push({ mask: masks[k], npix: counts[k], hue: peaks[k] });
-    return out;
+    const lineTh = median(allTh) || 3;
+    const closeGap = Math.max(4, Math.round(1.4 * lineTh));   // bridge a gridline-sized gap, but not real trace separation
+    const mergeTh = Math.max(7, Math.round(2.4 * lineTh));    // a single run this tall = two traces overlapping
+    const hi = { cols: [], rows: [] }, lo = { cols: [], rows: [] };
+    for (let i = 0; i < colRaw.length; i++) {
+      const c = scan_left + i, tops = colRaw[i].tops, bots = colRaw[i].bots;
+      if (!tops.length) continue;
+      // group raw runs separated by < closeGap (a trace split by a gridline -> one group)
+      const gT = [tops[0]], gB = [bots[0]];
+      for (let j = 1; j < tops.length; j++) {
+        if (tops[j] - gB[gB.length - 1] < closeGap) gB[gB.length - 1] = bots[j];
+        else { gT.push(tops[j]); gB.push(bots[j]); }
+      }
+      const k = gT.length, cen = function (j) { return (gT[j] + gB[j]) / 2; };
+      if (k >= 2) {                                 // two distinct traces: topmost = fetal, bottommost = maternal
+        hi.cols.push(c); hi.rows.push(cen(0));
+        lo.cols.push(c); lo.rows.push(cen(k - 1));
+      } else if (gB[0] - gT[0] + 1 >= mergeTh) {    // one run too tall to be a single line = traces overlapping
+        hi.cols.push(c); hi.rows.push(gT[0] + 2);
+        lo.cols.push(c); lo.rows.push(gB[0] - 2);
+      } else if (cen(0) < splitRow) { hi.cols.push(c); hi.rows.push(cen(0)); }   // lone thin trace: assign by value
+      else { lo.cols.push(c); lo.rows.push(cen(0)); }
+    }
+    return { hi: hi, lo: lo };
   }
 
   function digitize(d, W, H, opts) {
@@ -218,8 +289,18 @@
       throw new Error("could not detect enough gridlines (" + hrows.length + " horizontal, " +
         vcols.length + " vertical). Needs a strip with clear gray gridlines.");
 
-    const panels = splitPanels(hrows);
-    const fhrRows = panels.fhrRows, tocoRows = panels.tocoRows;
+    // Panel split by trace-ink position: the FHR/TOCO boundary is the widest interior
+    // ink-free band, which is robust even when the inter-panel gap is narrower than the
+    // gridline spacing (the gridline-gap heuristic fails there). Calibration below still
+    // uses the extreme gridlines, so the exact split index does not affect the scale.
+    const fullProf = rowInkProfile(d, W, H, o.sat, hrows[0], hrows[hrows.length - 1]);
+    let boundary = widestInteriorGap(fullProf, hrows[0], hrows[hrows.length - 1]);
+    if (boundary == null) boundary = splitPanels(hrows).boundary;          // fallback: gridline gap
+    let fhrRows = hrows.filter(function (r) { return r <= boundary; });
+    let tocoRows = hrows.filter(function (r) { return r > boundary; });
+    if (fhrRows.length < 2 || tocoRows.length < 2) {                       // safety: revert to gap split
+      const p = splitPanels(hrows); fhrRows = p.fhrRows; tocoRows = p.tocoRows; boundary = p.boundary;
+    }
 
     // --- Y calibration (override or standard fallback) ---
     let frT, fvT, frB, fvB;
@@ -264,19 +345,32 @@
     const to_fhr = function (rw) { return linmap(rw, frT, fvT, frB, fvB); };
     const to_toco = function (rw) { return linmap(rw, trT, tvT, trB, tvB); };
 
-    // --- color-agnostic trace extraction ---
-    const fhrTr = extractPanelTraces(d, W, H, o.sat, fhrRows[0] - 4, panels.boundary, 2);
-    const tocoTr = extractPanelTraces(d, W, H, o.sat, panels.boundary, tocoRows[tocoRows.length - 1] + 4, 1);
-
-    // build FHR outputs, labelled by mean value (higher = primary us_fhr_bpm)
+    // --- trace extraction: separate by PANEL and by VERTICAL POSITION (value), not color ---
+    // FHR panel: take one ink mask, then split it at the interior ink valley into an upper
+    // (higher bpm = fetal) and lower (adult range = maternal) trace. No valley => a single
+    // FHR trace, i.e. the maternal trace is simply absent (data missingness is expected).
+    const fhrTop = fhrRows[0] - 4, fhrBot = boundary;
+    const ftLo = Math.max(0, Math.floor(fhrTop)), ftHi = Math.min(H - 1, Math.ceil(fhrBot));
+    const fhrProf = rowInkProfile(d, W, H, o.sat, ftLo, ftHi);
+    const fhrSplit = widestInteriorGap(fhrProf, ftLo, ftHi);
+    const minMatCols = Math.max(20, Math.round(0.12 * (scan_right - scan_left)));
     const fhrOut = [];
-    for (let i = 0; i < fhrTr.length; i++) {
-      const tr = traceFromMask(fhrTr[i].mask, W, H, scan_left, scan_right);
-      if (!tr.cols.length) continue;
+    const pushFhr = function (tr) {
+      if (tr.cols.length < minMatCols) return;
       let s = 0; for (let j = 0; j < tr.rows.length; j++) s += to_fhr(tr.rows[j]);
-      fhrOut.push({ tr: tr, mean: s / tr.rows.length, hue: fhrTr[i].hue });
+      fhrOut.push({ tr: tr, mean: s / tr.rows.length, hue: meanHueAlong(d, W, tr) });
+    };
+    if (fhrSplit == null) {                               // one band -> single FHR trace (no maternal)
+      pushFhr(traceFromMask(inkMaskBand(d, W, H, o.sat, fhrTop, fhrBot), W, H, scan_left, scan_right));
+    } else {                                              // two bands -> fetal (upper) + maternal (lower)
+      const tk = extractStacked(d, W, H, o.sat, fhrTop, fhrBot, scan_left, scan_right, fhrSplit);
+      pushFhr(tk.hi); pushFhr(tk.lo);
     }
-    fhrOut.sort(function (a, b) { return b.mean - a.mean; });
+    fhrOut.sort(function (a, b) { return b.mean - a.mean; });   // higher bpm first = fetal
+
+    // TOCO panel is its own subplot: a single trace, lower ink band
+    const tocoInk = inkMaskBand(d, W, H, o.sat, boundary, tocoRows[tocoRows.length - 1] + 4);
+    const tocoTrace = traceFromMask(tocoInk, W, H, scan_left, scan_right);
 
     const overlay = {}, present = [];
     function addSeries(name, tr, conv) {
@@ -288,10 +382,7 @@
     }
     if (fhrOut[0]) addSeries("us_fhr_bpm", fhrOut[0].tr, to_fhr, fhrOut[0].hue);
     if (fhrOut[1]) addSeries("fhr2_bpm", fhrOut[1].tr, to_fhr, fhrOut[1].hue);
-    if (tocoTr[0]) {
-      const tr = traceFromMask(tocoTr[0].mask, W, H, scan_left, scan_right);
-      if (tr.cols.length) addSeries("toco", tr, to_toco, tocoTr[0].hue);
-    }
+    if (tocoTrace.cols.length) addSeries("toco", tocoTrace, to_toco, meanHue(d, tocoInk));
     if (!present.length) throw new Error("no colored traces detected. Try a lower color sensitivity.");
 
     const sec_per_px = (end_min - o.start_min) * 60.0 / (x_right - x_left);
