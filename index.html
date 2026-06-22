@@ -88,18 +88,19 @@
 
   function mode() { return document.querySelector('input[name=mode]:checked').value; }
 
-  // Recursively collect accepted files from a dropped FileSystemEntry (file or folder).
+  // Collect accepted files from a dropped entry: a file directly, or a folder's TOP-LEVEL
+  // files only -- nested subfolders are intentionally not descended into.
   var ACCEPT = /\.(pdf|png|jpe?g|bmp)$/i;
+  function addFile(e, out) { return new Promise(function (res) { if (e.isFile) e.file(function (f) { if (ACCEPT.test(f.name)) out.push(f); res(); }, function () { res(); }); else res(); }); }
   function entryFiles(entry, out) {
+    if (entry.isFile) return addFile(entry, out);
+    if (!entry.isDirectory) return Promise.resolve();
     return new Promise(function (resolve) {
-      if (entry.isFile) { entry.file(function (f) { if (ACCEPT.test(f.name)) out.push(f); resolve(); }, function () { resolve(); }); }
-      else if (entry.isDirectory) {
-        var rd = entry.createReader(), acc = [];
-        (function next() { rd.readEntries(function (b) {  // readEntries yields at most ~100 per call
-          if (!b.length) { Promise.all(acc.map(function (e) { return entryFiles(e, out); })).then(resolve); }
-          else { acc = acc.concat(Array.prototype.slice.call(b)); next(); }
-        }, function () { resolve(); }); })();
-      } else { resolve(); }
+      var rd = entry.createReader(), acc = [];
+      (function next() { rd.readEntries(function (b) {  // readEntries yields at most ~100 per call
+        if (!b.length) { Promise.all(acc.map(function (e) { return addFile(e, out); })).then(resolve); }  // files only, no recursion
+        else { acc = acc.concat(Array.prototype.slice.call(b)); next(); }
+      }, function () { resolve(); }); })();
     });
   }
   // Expand a drop into a flat, name-sorted File[] — supports dropped folders, falls back to dataTransfer.files.
