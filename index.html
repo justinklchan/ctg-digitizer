@@ -258,7 +258,7 @@
             });
           });
           return c;
-        }).catch(function (e) { renderCard({ label: file.name, csvStem: "x", canvas: document.createElement("canvas") }, null, null, e); }).then(function () { done++; setProgress(done, total); progress.textContent = "processed " + done + " / " + total + " file(s)"; });
+        }).catch(function (e) { renderCard({ label: file.name, csvStem: "x", canvas: document.createElement("canvas") }, null, null, e); }).then(function () { done++; setProgress(done, total); progress.textContent = "processed " + done + " / " + total + " (" + Math.round(done / total * 100) + "%)"; });
       });
     });
     chain.then(function () { var ok = processed.length; progress.textContent = "done · " + ok + " CSV" + (ok === 1 ? "" : "s") + " ready" + (done < total ? " (" + (total - done) + " file errors)" : ""); dlzip.disabled = ok === 0; });
