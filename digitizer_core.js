@@ -378,19 +378,23 @@
     const ftLo = Math.max(0, Math.floor(fhrTop)), ftHi = Math.min(H - 1, Math.ceil(fhrBot));
     const fhrProf = rowInkProfile(d, W, H, ink, ftLo, ftHi);
     const fhrSplit = widestInteriorGap(fhrProf, ftLo, ftHi);
-    const minMatCols = Math.max(20, Math.round(0.12 * (scan_right - scan_left)));
-    const fhrOut = [];
-    const pushFhr = function (tr) {
-      if (tr.cols.length < minMatCols) return;
+    const scanW = Math.max(1, scan_right - scan_left);
+    const cand = [];
+    const consider = function (tr) {
+      if (!tr.cols.length) return;
       let s = 0; for (let j = 0; j < tr.rows.length; j++) s += to_fhr(tr.rows[j]);
-      fhrOut.push({ tr: tr, mean: s / tr.rows.length, hue: meanHueAlong(d, W, tr) });
+      cand.push({ tr: tr, mean: s / tr.rows.length, hue: meanHueAlong(d, W, tr), cov: tr.cols.length / scanW });
     };
     if (fhrSplit == null) {                               // one band -> single FHR trace (no maternal)
-      pushFhr(traceFromMask(inkMaskBand(d, W, H, ink, fhrTop, fhrBot), W, H, scan_left, scan_right));
+      consider(traceFromMask(inkMaskBand(d, W, H, ink, fhrTop, fhrBot), W, H, scan_left, scan_right));
     } else {                                              // two bands -> fetal (upper) + maternal (lower)
       const tk = extractStacked(d, W, H, ink, fhrTop, fhrBot, scan_left, scan_right, fhrSplit);
-      pushFhr(tk.hi); pushFhr(tk.lo);
+      consider(tk.hi); consider(tk.lo);
     }
+    // A real FHR/maternal trace spans most of the strip; drop sparse components that are
+    // really text/arrow annotations (e.g. "80 BPM" labels), not a heart-rate trace.
+    let fhrOut = cand.filter(function (c) { return c.cov >= 0.5; });
+    if (!fhrOut.length && cand.length) { cand.sort(function (a, b) { return b.cov - a.cov; }); fhrOut = [cand[0]]; }
     fhrOut.sort(function (a, b) { return b.mean - a.mean; });   // higher bpm first = fetal
 
     // TOCO panel is its own subplot: a single trace, lower ink band
