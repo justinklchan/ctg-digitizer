@@ -1,10 +1,12 @@
 /* digitizer_core.js -- DOM-free CTG strip -> series extractor.
  *
- * Color-agnostic: traces are separated by PANEL (top = FHR, bottom = TOCO,
- * split at the largest horizontal-gridline gap), and within a panel by HUE
- * clustering -- no assumption that the traces are blue/green/purple. The two
- * FHR-panel traces are labelled by mean value (higher = us_fhr_bpm, the primary
- * FHR; lower = fhr2_bpm), which matches the usual FHR-above-maternal layout.
+ * Color-agnostic: the color SCHEME is auto-detected -- either gray gridlines with
+ * colored traces (the common case) or a colored gridline lattice with dark/achromatic
+ * traces -- and traces are separated by PANEL (top = FHR, bottom = TOCO) and by VERTICAL
+ * POSITION within a panel (the widest interior ink-free valley), never by hue. The two
+ * FHR-panel traces are labelled by mean value (higher = us_fhr_bpm, the primary FHR;
+ * lower = fhr2_bpm = maternal), matching the usual FHR-above-maternal layout; the maternal
+ * trace is emitted only when actually present.
  *
  * Calibration is either taken from explicit overrides (opts.fhr_cal /
  * opts.toco_cal / opts.start_min / opts.end_min, e.g. from OCR of the printed
@@ -71,6 +73,25 @@
     return { rows: groupLines(rowIdx, 3), cols: groupLines(colIdx, 3) };
   }
 
+  // --- gridlines when the lattice is COLORED (and traces are dark/achromatic): saturated,
+  //     not-white rows/cols covering most of the span. Inverse of the gray-gridline case. ---
+  function detectGridlinesColored(d, W, H, gsat) {
+    const rowCount = new Int32Array(H), colCount = new Int32Array(W);
+    for (let y = 0; y < H; y++) {
+      let off = y * W * 4;
+      for (let x = 0; x < W; x++, off += 4) {
+        const r = d[off], g = d[off + 1], b = d[off + 2];
+        const mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
+        const mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
+        if (mx - mn >= gsat && mx < 195) { rowCount[y]++; colCount[x]++; }   // bold/dark colored line (major, not faint minor)
+      }
+    }
+    const rowIdx = [], colIdx = [];
+    for (let y = 0; y < H; y++) if (rowCount[y] / W > 0.4) rowIdx.push(y);
+    for (let x = 0; x < W; x++) if (colCount[x] / H > 0.4) colIdx.push(x);
+    return { rows: groupLines(rowIdx, 3), cols: groupLines(colIdx, 3) };
+  }
+
   // split horizontal gridlines into FHR (top) and TOCO (bottom) at the biggest gap
   function splitPanels(hrows) {
     let gi = 1, gmax = -1;
@@ -125,15 +146,12 @@
   }
 
   // --- per-row "ink" (saturated = colored trace) count over [lo,hi], lightly smoothed ---
-  function rowInkProfile(d, W, H, sat, lo, hi) {
+  function rowInkProfile(d, W, H, ink, lo, hi) {
     const prof = new Float64Array(H);
     for (let y = lo; y <= hi; y++) {
       let off = y * W * 4, c = 0;
       for (let x = 0; x < W; x++, off += 4) {
-        const r = d[off], g = d[off + 1], b = d[off + 2];
-        const mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
-        const mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
-        if (mx - mn >= sat) c++;
+        if (ink(d[off], d[off + 1], d[off + 2])) c++;
       }
       prof[y] = c;
     }
@@ -169,17 +187,14 @@
     return best ? Math.round((best[0] + best[1]) / 2) : null;
   }
 
-  // ink mask (saturated pixels) within a row band
-  function inkMaskBand(d, W, H, sat, rTop, rBot) {
+  // ink mask (trace pixels per the ink predicate) within a row band
+  function inkMaskBand(d, W, H, ink, rTop, rBot) {
     const y0 = Math.max(0, Math.floor(rTop)), y1 = Math.min(H, Math.ceil(rBot));
     const m = new Uint8Array(W * H);
     for (let y = y0; y < y1; y++) {
       let off = y * W * 4;
       for (let x = 0; x < W; x++, off += 4) {
-        const r = d[off], g = d[off + 1], b = d[off + 2];
-        const mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
-        const mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
-        if (mx - mn >= sat) m[y * W + x] = 1;
+        if (ink(d[off], d[off + 1], d[off + 2])) m[y * W + x] = 1;
       }
     }
     return m;
@@ -218,7 +233,7 @@
   // maternal line is still kept as fetal. A column with a single run is assigned by which
   // side of splitRow it falls on, and the other trace simply gets no point there -- so a
   // missing or absent maternal trace is preserved rather than fabricated.
-  function extractStacked(d, W, H, sat, rTop, rBot, scan_left, scan_right, splitRow) {
+  function extractStacked(d, W, H, ink, rTop, rBot, scan_left, scan_right, splitRow) {
     const y0 = Math.max(0, Math.floor(rTop)), y1 = Math.min(H, Math.ceil(rBot));
     // pass 1: raw vertical ink runs per column (split at any gap > 2 px) + thickness stats
     const colRaw = [], allTh = [];
@@ -227,10 +242,7 @@
       let s = -1, last = -10;
       for (let y = y0; y < y1; y++) {
         const off = (y * W + c) * 4;
-        const r = d[off], g = d[off + 1], b = d[off + 2];
-        const mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
-        const mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
-        if (mx - mn >= sat) {
+        if (ink(d[off], d[off + 1], d[off + 2])) {
           if (s < 0) s = y;
           else if (y - last > 2) { tops.push(s); bots.push(last); allTh.push(last - s + 1); s = y; }
           last = y;
@@ -283,17 +295,30 @@
     const log = [];
     log.push("loaded image (" + W + "x" + H + " px)");
 
-    const grid = detectGridlines(d, W, H);
+    // Detect gridlines and pick a color scheme. Default: gray gridlines + colored traces.
+    // If no gray lattice is found, the gridlines are colored (e.g. brown/pink) and the traces
+    // are dark/achromatic (e.g. black) -- detect the colored lattice and flip the ink test.
+    let grid = detectGridlines(d, W, H), colored = false;
+    if (grid.rows.length < 4 || grid.cols.length < 2) {
+      const gc = detectGridlinesColored(d, W, H, Math.max(20, o.sat - 5));
+      if (gc.rows.length >= 4 && gc.cols.length >= 2) { grid = gc; colored = true; }
+    }
     const hrows = grid.rows, vcols = grid.cols;
     if (hrows.length < 4 || vcols.length < 2)
       throw new Error("could not detect enough gridlines (" + hrows.length + " horizontal, " +
-        vcols.length + " vertical). Needs a strip with clear gray gridlines.");
+        vcols.length + " vertical). Needs a strip with clear gridlines.");
+    // ink(r,g,b) = "is a trace pixel". Colored-grid strips: dark/achromatic ink. Gray-grid
+    // strips (the common case): saturated/colored ink, matching the original behavior.
+    const ink = colored
+      ? function (r, g, b) { const mx = r > g ? (r > b ? r : b) : (g > b ? g : b), mn = r < g ? (r < b ? r : b) : (g < b ? g : b); return mx - mn < o.sat && mx < 160; }
+      : function (r, g, b) { const mx = r > g ? (r > b ? r : b) : (g > b ? g : b), mn = r < g ? (r < b ? r : b) : (g < b ? g : b); return mx - mn >= o.sat; };
+    log.push("color scheme: " + (colored ? "colored gridlines / dark traces" : "gray gridlines / colored traces"));
 
     // Panel split by trace-ink position: the FHR/TOCO boundary is the widest interior
     // ink-free band, which is robust even when the inter-panel gap is narrower than the
     // gridline spacing (the gridline-gap heuristic fails there). Calibration below still
     // uses the extreme gridlines, so the exact split index does not affect the scale.
-    const fullProf = rowInkProfile(d, W, H, o.sat, hrows[0], hrows[hrows.length - 1]);
+    const fullProf = rowInkProfile(d, W, H, ink, hrows[0], hrows[hrows.length - 1]);
     let boundary = widestInteriorGap(fullProf, hrows[0], hrows[hrows.length - 1]);
     if (boundary == null) boundary = splitPanels(hrows).boundary;          // fallback: gridline gap
     let fhrRows = hrows.filter(function (r) { return r <= boundary; });
@@ -351,7 +376,7 @@
     // FHR trace, i.e. the maternal trace is simply absent (data missingness is expected).
     const fhrTop = fhrRows[0] - 4, fhrBot = boundary;
     const ftLo = Math.max(0, Math.floor(fhrTop)), ftHi = Math.min(H - 1, Math.ceil(fhrBot));
-    const fhrProf = rowInkProfile(d, W, H, o.sat, ftLo, ftHi);
+    const fhrProf = rowInkProfile(d, W, H, ink, ftLo, ftHi);
     const fhrSplit = widestInteriorGap(fhrProf, ftLo, ftHi);
     const minMatCols = Math.max(20, Math.round(0.12 * (scan_right - scan_left)));
     const fhrOut = [];
@@ -361,15 +386,15 @@
       fhrOut.push({ tr: tr, mean: s / tr.rows.length, hue: meanHueAlong(d, W, tr) });
     };
     if (fhrSplit == null) {                               // one band -> single FHR trace (no maternal)
-      pushFhr(traceFromMask(inkMaskBand(d, W, H, o.sat, fhrTop, fhrBot), W, H, scan_left, scan_right));
+      pushFhr(traceFromMask(inkMaskBand(d, W, H, ink, fhrTop, fhrBot), W, H, scan_left, scan_right));
     } else {                                              // two bands -> fetal (upper) + maternal (lower)
-      const tk = extractStacked(d, W, H, o.sat, fhrTop, fhrBot, scan_left, scan_right, fhrSplit);
+      const tk = extractStacked(d, W, H, ink, fhrTop, fhrBot, scan_left, scan_right, fhrSplit);
       pushFhr(tk.hi); pushFhr(tk.lo);
     }
     fhrOut.sort(function (a, b) { return b.mean - a.mean; });   // higher bpm first = fetal
 
     // TOCO panel is its own subplot: a single trace, lower ink band
-    const tocoInk = inkMaskBand(d, W, H, o.sat, boundary, tocoRows[tocoRows.length - 1] + 4);
+    const tocoInk = inkMaskBand(d, W, H, ink, boundary, tocoRows[tocoRows.length - 1] + 4);
     const tocoTrace = traceFromMask(tocoInk, W, H, scan_left, scan_right);
 
     const overlay = {}, present = [];
