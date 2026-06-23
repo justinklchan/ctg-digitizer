@@ -85,6 +85,7 @@
   var dlzip = $("dlzip"), bar = $("bar"), progress = $("progress"), pbar = $("pbar");
   function setProgress(done, total) { pbar.classList.toggle("hidden", total <= 1); pbar.firstChild.style.width = total ? Math.round(done / total * 100) + "%" : "0"; }
   var processed = [], MAXW = 1100, S = 5, tessWorker = null;
+  var SHOW_CAL_DETAILS = false;   // set true to re-enable the per-result "calibration details" log box
 
   function mode() { return document.querySelector('input[name=mode]:checked').value; }
 
@@ -226,10 +227,12 @@
     var a = document.createElement("a"); a.className = "dl"; a.href = "#"; a.textContent = "↓ download " + name;
     a.addEventListener("click", function (e) { e.preventDefault(); saveCsv(name, res.csv); }); row.appendChild(a); card.appendChild(row);
 
-    var det = document.createElement("details"); var sum = document.createElement("summary"); sum.textContent = "calibration details"; det.appendChild(sum);
-    var pre = document.createElement("pre"); pre.className = "log";
-    var txt = res.log.join("\n"); if (cal && cal.warnings && cal.warnings.length) txt += "\n\nOCR notes:\n  " + cal.warnings.join("\n  ");
-    pre.textContent = txt; det.appendChild(pre); card.appendChild(det);
+    if (SHOW_CAL_DETAILS) {
+      var det = document.createElement("details"); var sum = document.createElement("summary"); sum.textContent = "calibration details"; det.appendChild(sum);
+      var pre = document.createElement("pre"); pre.className = "log";
+      var txt = res.log.join("\n"); if (cal && cal.warnings && cal.warnings.length) txt += "\n\nOCR notes:\n  " + cal.warnings.join("\n  ");
+      pre.textContent = txt; det.appendChild(pre); card.appendChild(det);
+    }
     results.insertBefore(card, results.firstChild);
   }
 
