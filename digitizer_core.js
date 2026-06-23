@@ -434,31 +434,40 @@
     const tocoTrace = traceFromMask(tocoInk, W, H, scan_left, scan_right);
 
     const overlay = {}, present = [];
-    // Drop isolated samples that jump far from the local median: these are annotation marks
-    // (axis-label text, arrows, event markers) caught at scattered columns, not the trace.
-    // A real decel/contraction moves gradually, so the local median tracks it and it survives.
-    function despike(cols, rows, conv, maxDev) {
-      const n = rows.length; if (n < 6) return { cols: cols, rows: rows };
-      const half = 7, oc = [], orow = [], win = [];
+    // Hampel-style despike: drop samples that sit far outside the LOCAL baseline (rolling
+    // median +/- a robust spread). Annotation marks (axis text, arrows, event markers) caught
+    // at scattered columns jump well off the trace and are removed -- e.g. a baseline hovering
+    // at 180 bpm cannot really have points at 210. A real decel/contraction moves gradually,
+    // so the rolling median tracks it and it survives. `floor` is the physiological minimum
+    // deviation (bpm / TOCO units) tolerated, so a flat, tight baseline isn't over-trimmed.
+    function despike(cols, rows, conv, floor) {
+      const n = rows.length; if (n < 8) return { cols: cols, rows: rows };
+      const half = Math.min(60, n >> 2), K = 4, val = new Array(n);  // wide enough to resist dense spike bursts
+      for (let i = 0; i < n; i++) val[i] = conv(rows[i]);
+      const oc = [], orow = [], win = [], dev = [];
       for (let i = 0; i < n; i++) {
         const lo = Math.max(0, i - half), hi = Math.min(n - 1, i + half);
-        win.length = 0; for (let k = lo; k <= hi; k++) win.push(conv(rows[k]));
+        win.length = 0; for (let k = lo; k <= hi; k++) win.push(val[k]);
         win.sort(function (a, b) { return a - b; });
-        if (Math.abs(conv(rows[i]) - win[win.length >> 1]) <= maxDev) { oc.push(cols[i]); orow.push(rows[i]); }
+        const m = win[win.length >> 1];
+        dev.length = 0; for (let k = 0; k < win.length; k++) dev.push(Math.abs(win[k] - m));
+        dev.sort(function (a, b) { return a - b; });
+        const thr = Math.max(floor, K * 1.4826 * dev[dev.length >> 1]);   // MAD -> robust sigma
+        if (Math.abs(val[i] - m) <= thr) { oc.push(cols[i]); orow.push(rows[i]); }
       }
       return { cols: oc, rows: orow };
     }
-    function addSeries(name, tr, conv, hue, maxDev) {
-      const ft = maxDev ? despike(tr.cols, tr.rows, conv, maxDev) : tr;
+    function addSeries(name, tr, conv, hue, floor) {
+      const ft = floor ? despike(tr.cols, tr.rows, conv, floor) : tr;
       overlay[name] = { cols: ft.cols, rows: ft.rows, conv: conv };
       present.push(name);
       let vmin = Infinity, vmax = -Infinity;
       for (let j = 0; j < ft.rows.length; j++) { const v = conv(ft.rows[j]); if (v < vmin) vmin = v; if (v > vmax) vmax = v; }
       log.push(pad(name, 11) + ": " + ft.cols.length + " pts, range " + vmin.toFixed(1) + ".." + vmax.toFixed(1) + " (hue " + Math.round(hue || 0) + ")");
     }
-    if (fhrOut[0]) addSeries("us_fhr_bpm", fhrOut[0].tr, to_fhr, fhrOut[0].hue, 25);
-    if (fhrOut[1]) addSeries("fhr2_bpm", fhrOut[1].tr, to_fhr, fhrOut[1].hue, 25);
-    if (tocoTrace.cols.length) addSeries("toco", tocoTrace, to_toco, meanHue(d, tocoInk), 25);
+    if (fhrOut[0]) addSeries("us_fhr_bpm", fhrOut[0].tr, to_fhr, fhrOut[0].hue, 12);
+    if (fhrOut[1]) addSeries("fhr2_bpm", fhrOut[1].tr, to_fhr, fhrOut[1].hue, 12);
+    if (tocoTrace.cols.length) addSeries("toco", tocoTrace, to_toco, meanHue(d, tocoInk), 18);
     if (!present.length) throw new Error("no colored traces detected. Try a lower color sensitivity.");
 
     const sec_per_px = (end_min - o.start_min) * 60.0 / (x_right - x_left);
