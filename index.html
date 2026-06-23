@@ -106,12 +106,20 @@
   }
   // Expand a drop into a flat, name-sorted File[] — supports dropped folders, falls back to dataTransfer.files.
   function filesFromDrop(dt) {
+    // Capture the plain file list SYNCHRONOUSLY (dataTransfer empties after the event/await).
+    var plain = Array.prototype.slice.call(dt.files || []).filter(function (f) { return ACCEPT.test(f.name); });
     var items = dt.items, ents = [];
     if (items && items.length && items[0].webkitGetAsEntry) {
       for (var i = 0; i < items.length; i++) { var e = items[i].webkitGetAsEntry(); if (e) ents.push(e); }  // must be called sync
     }
-    if (ents.length) { var out = []; return Promise.all(ents.map(function (e) { return entryFiles(e, out); })).then(function () { out.sort(function (a, b) { return a.name < b.name ? -1 : 1; }); return out; }); }
-    return Promise.resolve(Array.prototype.slice.call(dt.files).filter(function (f) { return ACCEPT.test(f.name); }));
+    // Only use the FileSystemEntry path when a FOLDER is actually dropped; plain files go
+    // straight through dataTransfer.files (robust under file://, where the entry API is blocked).
+    var hasDir = ents.some(function (e) { return e.isDirectory; });
+    if (!ents.length || !hasDir) return Promise.resolve(plain);
+    var out = [];
+    return Promise.all(ents.map(function (e) { return entryFiles(e, out); }))
+      .then(function () { out.sort(function (a, b) { return a.name < b.name ? -1 : 1; }); return out.length ? out : plain; })
+      .catch(function () { return plain; });
   }
 
   drop.addEventListener("dragover", function (e) { e.preventDefault(); drop.classList.add("hover"); });
