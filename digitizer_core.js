@@ -92,6 +92,32 @@
     return { rows: groupLines(rowIdx, 3), cols: groupLines(colIdx, 3) };
   }
 
+  // is the page a dark monitor screenshot (vs printed-paper white)?  median luma over a sample.
+  function isDarkBackground(d, W, H) {
+    const lum = [], sy = Math.max(1, (H / 80) | 0), sx = Math.max(1, (W / 80) | 0);
+    for (let y = 0; y < H; y += sy) for (let x = 0; x < W; x += sx) { const o = (y * W + x) * 4; lum.push((d[o] + d[o + 1] + d[o + 2]) / 3); }
+    return median(lum) < 90;
+  }
+
+  // --- gridlines on a DARK background: bright, low-saturation (white/gray) rows/cols. The
+  //     colored traces are saturated so they are excluded; text is bright but not full-span. ---
+  function detectGridlinesBright(d, W, H) {
+    const rowCount = new Int32Array(H), colCount = new Int32Array(W);
+    for (let y = 0; y < H; y++) {
+      let off = y * W * 4;
+      for (let x = 0; x < W; x++, off += 4) {
+        const r = d[off], g = d[off + 1], b = d[off + 2];
+        const mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
+        const mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
+        if (mx >= 80 && mx - mn < 40) { rowCount[y]++; colCount[x]++; }   // bright + low-sat = white/gray line, not a colored trace
+      }
+    }
+    const rowIdx = [], colIdx = [];
+    for (let y = 0; y < H; y++) if (rowCount[y] / W > 0.4) rowIdx.push(y);
+    for (let x = 0; x < W; x++) if (colCount[x] / H > 0.4) colIdx.push(x);
+    return { rows: groupLines(rowIdx, 3), cols: groupLines(colIdx, 3) };
+  }
+
   // split horizontal gridlines into FHR (top) and TOCO (bottom) at the biggest gap
   function splitPanels(hrows) {
     let gi = 1, gmax = -1;
@@ -298,21 +324,27 @@
     // Detect gridlines and pick a color scheme. Default: gray gridlines + colored traces.
     // If no gray lattice is found, the gridlines are colored (e.g. brown/pink) and the traces
     // are dark/achromatic (e.g. black) -- detect the colored lattice and flip the ink test.
-    let grid = detectGridlines(d, W, H), colored = false;
-    if (grid.rows.length < 4 || grid.cols.length < 2) {
-      const gc = detectGridlinesColored(d, W, H, Math.max(20, o.sat - 5));
-      if (gc.rows.length >= 4 && gc.cols.length >= 2) { grid = gc; colored = true; }
+    const darkBg = isDarkBackground(d, W, H);
+    let grid, colored = false;
+    if (darkBg) {
+      grid = detectGridlinesBright(d, W, H);             // white/gray lattice on dark bg; traces are colored
+    } else {
+      grid = detectGridlines(d, W, H);
+      if (grid.rows.length < 4 || grid.cols.length < 2) {
+        const gc = detectGridlinesColored(d, W, H, Math.max(20, o.sat - 5));
+        if (gc.rows.length >= 4 && gc.cols.length >= 2) { grid = gc; colored = true; }
+      }
     }
     const hrows = grid.rows, vcols = grid.cols;
     if (hrows.length < 4 || vcols.length < 2)
       throw new Error("could not detect enough gridlines (" + hrows.length + " horizontal, " +
         vcols.length + " vertical). Needs a strip with clear gridlines.");
-    // ink(r,g,b) = "is a trace pixel". Colored-grid strips: dark/achromatic ink. Gray-grid
-    // strips (the common case): saturated/colored ink, matching the original behavior.
+    // ink(r,g,b) = "is a trace pixel". Colored-gridline strips: dark/achromatic ink. Gray-grid
+    // and dark-background strips: saturated/colored ink (so white text/gridlines are ignored).
     const ink = colored
       ? function (r, g, b) { const mx = r > g ? (r > b ? r : b) : (g > b ? g : b), mn = r < g ? (r < b ? r : b) : (g < b ? g : b); return mx - mn < o.sat && mx < 160; }
       : function (r, g, b) { const mx = r > g ? (r > b ? r : b) : (g > b ? g : b), mn = r < g ? (r < b ? r : b) : (g < b ? g : b); return mx - mn >= o.sat; };
-    log.push("color scheme: " + (colored ? "colored gridlines / dark traces" : "gray gridlines / colored traces"));
+    log.push("color scheme: " + (darkBg ? "dark background / colored traces" : colored ? "colored gridlines / dark traces" : "gray gridlines / colored traces"));
 
     // Panel split by trace-ink position: the FHR/TOCO boundary is the widest interior
     // ink-free band, which is robust even when the inter-panel gap is narrower than the
