@@ -569,16 +569,23 @@
     // --- output columns ---
     let timeGrid, colsOut;
     if (o.grid_s == null) {
-      const n = scan_right - scan_left;
+      // Uniform per-pixel grid over the FULL time-axis span [x_left, x_right] (first..last
+      // vertical gridline), INCLUSIVE: every vertical pixel column of the strip gets exactly one
+      // row, and each cell is either a valid reading or NaN. A column carries a value where its
+      // trace was read and NaN everywhere else -- including columns inside the axis-number crop
+      // margins ([x_left,scan_left) / (scan_right,x_right]) where traces are intentionally not
+      // read, so the grid stays dense (no missing columns). Trace READING is still confined to
+      // [scan_left, scan_right]; only the OUTPUT grid is widened to the whole span.
+      const gridLeft = x_left, gridRight = x_right, n = gridRight - gridLeft + 1;
       timeGrid = new Float64Array(n);
-      for (let i = 0; i < n; i++) timeGrid[i] = to_time(scan_left + i);
+      for (let i = 0; i < n; i++) timeGrid[i] = to_time(gridLeft + i);
       colsOut = {};
       for (let pi = 0; pi < present.length; pi++) {
         const nm = present[pi], ov = overlay[nm], y = new Float64Array(n); y.fill(NaN);
-        for (let j = 0; j < ov.cols.length; j++) y[ov.cols[j] - scan_left] = ov.conv(ov.rows[j]);
+        for (let j = 0; j < ov.cols.length; j++) { const idx = ov.cols[j] - gridLeft; if (idx >= 0 && idx < n) y[idx] = ov.conv(ov.rows[j]); }
         colsOut[nm] = y;
       }
-      log.push("grid step : " + sec_per_px.toFixed(4) + " s (" + (1 / sec_per_px).toFixed(2) + " Hz, raw per-pixel, " + n + " cols)");
+      log.push("grid step : " + sec_per_px.toFixed(4) + " s (" + (1 / sec_per_px).toFixed(2) + " Hz, raw per-pixel, " + n + " cols, full span " + gridLeft + ".." + gridRight + ")");
     } else {
       const max_gap_s = o.max_gap_px * sec_per_px, series = {};
       let t_lo = Infinity, t_hi = -Infinity;
