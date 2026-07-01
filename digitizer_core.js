@@ -150,6 +150,52 @@
     return runs;
   }
 
+  // --- de-identification: locate a printed patient-identity (PHI) header band ---
+  // Real hospital CTG printouts carry patient identity (name / MRN / DOB, dates)
+  // in a text band ABOVE the trace grid. This finds the first horizontal gridline
+  // (top of the FHR panel) and, if there is a block of text ink in the margin
+  // above it, returns the pixel row at which to crop so that band — including the
+  // name — is removed, leaving the trace and its top axis number intact. Returns
+  // -1 when there is no such header (already-cropped / anonymized strips, or a
+  // dark monitor screenshot), so clean images are left untouched. Pixel-only, no
+  // OCR: a header row has some dark/saturated ink but does not span the width like
+  // a gridline; the cut lands in the white gap between the header and the grid.
+  function detectHeaderCut(d, W, H) {
+    if (isDarkBackground(d, W, H)) return -1;              // monitor screenshot: no printed PHI band
+    const grid = detectGridlines(d, W, H);
+    if (grid.rows.length < 4 || grid.cols.length < 2) return -1;   // not a recognizable strip; don't crop
+    const top = grid.rows[0];
+    if (top < 0.03 * H) return -1;                         // trace already starts at the top: nothing above to crop
+    const minInk = Math.max(6, Math.round(0.004 * W));     // a few characters' worth of ink flags a text row
+    const isText = new Uint8Array(top);
+    for (let y = 0; y < top; y++) {
+      let ink = 0, off = y * W * 4;
+      for (let x = 0; x < W; x++, off += 4) {
+        const r = d[off], g = d[off + 1], b = d[off + 2];
+        const mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
+        const mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
+        if ((mx < 150 && mx - mn < 45) || (mx - mn >= 55 && mx < 235)) ink++;   // dark text OR saturated logo/legend ink
+      }
+      if (ink >= minInk && ink < 0.5 * W) isText[y] = 1;   // ink present but not a full-span gridline
+    }
+    // The top axis number ("240") hugs the first gridline; reserve a guard band for
+    // it so its glyph is never mistaken for header text (which would false-trigger a
+    // crop on an already-cropped strip) and is never cut off. A real header lives
+    // ABOVE that band.
+    const guard = Math.max(3, Math.round(0.02 * H));
+    const scanEnd = top - guard;
+    if (scanEnd <= 2) return -1;
+    let textRows = 0;
+    for (let y = 0; y < scanEnd; y++) if (isText[y]) textRows++;
+    if (textRows < 3) return -1;                            // no real header text block → clean top margin
+    // Cut the ENTIRE header (name, MRN/DOB, recording date/time, legend) at the base
+    // of the header block, just above the axis-number guard band so the top axis
+    // number is kept. Nudge onto a white row so a text line is never split.
+    let cut = scanEnd;
+    while (cut < top && isText[cut]) cut++;
+    return cut > 2 && cut < top ? cut : -1;
+  }
+
   function dominantRunCenter(ys) {
     if (ys.length === 1) return ys[0];
     const starts = [0], ends = [];
@@ -226,6 +272,33 @@
     return m;
   }
 
+  // FHR-panel mask = all strictly-colored (saturated) trace pixels UNCHANGED (so a thin 1px
+  // trace is preserved in full) UNION the EXTRA muted-color pixels that `inkSoft` adds but
+  // `ink` does not, kept only where they form a vertical run of >= 2 px. That run filter drops
+  // isolated 1px scanner speckle while keeping a genuine faint (e.g. desaturated green
+  // maternal/MHR) trace, which is a few px thick -- without ever thinning the saturated traces.
+  function fhrPanelMask(d, W, H, ink, inkSoft, rTop, rBot) {
+    const y0 = Math.max(0, Math.floor(rTop)), y1 = Math.min(H, Math.ceil(rBot));
+    const m = inkMaskBand(d, W, H, ink, rTop, rBot);        // strict pixels, unfiltered
+    const muted = new Uint8Array(W * H);
+    for (let y = y0; y < y1; y++) { let off = (y * W) * 4; for (let x = 0; x < W; x++, off += 4) { const i = y * W + x; if (!m[i] && inkSoft(d[off], d[off + 1], d[off + 2])) muted[i] = 1; } }
+    for (let y = y0; y < y1; y++) for (let x = 0; x < W; x++) {
+      const i = y * W + x;
+      if (muted[i] && ((y > y0 && muted[i - W]) || (y < y1 - 1 && muted[i + W]))) m[i] = 1;   // muted, in a >=2px run
+    }
+    return m;
+  }
+
+  // per-row set-pixel count over [lo,hi] for a precomputed mask, lightly smoothed (mask analog
+  // of rowInkProfile) -- used to find the interior gap that separates two stacked traces.
+  function maskRowProfile(mask, W, H, lo, hi) {
+    const prof = new Float64Array(H);
+    for (let y = lo; y <= hi; y++) { let c = 0, base = y * W; for (let x = 0; x < W; x++) if (mask[base + x]) c++; prof[y] = c; }
+    const sm = new Float64Array(H), win = 3;
+    for (let y = lo; y <= hi; y++) { let s = 0, n = 0; for (let k = -win; k <= win; k++) { const yy = y + k; if (yy >= lo && yy <= hi) { s += prof[yy]; n++; } } sm[y] = s / n; }
+    return sm;
+  }
+
   // mean hue over a mask's set pixels -- for display/logging only, never to classify a trace
   function meanHue(d, mask) {
     let sx = 0, sy = 0, n = 0;
@@ -259,7 +332,7 @@
   // maternal line is still kept as fetal. A column with a single run is assigned by which
   // side of splitRow it falls on, and the other trace simply gets no point there -- so a
   // missing or absent maternal trace is preserved rather than fabricated.
-  function extractStacked(d, W, H, ink, rTop, rBot, scan_left, scan_right, splitRow) {
+  function extractStacked(mask, W, H, rTop, rBot, scan_left, scan_right, splitRow) {
     const y0 = Math.max(0, Math.floor(rTop)), y1 = Math.min(H, Math.ceil(rBot));
     // pass 1: raw vertical ink runs per column (split at any gap > 2 px) + thickness stats
     const colRaw = [], allTh = [];
@@ -267,8 +340,7 @@
       const tops = [], bots = [];
       let s = -1, last = -10;
       for (let y = y0; y < y1; y++) {
-        const off = (y * W + c) * 4;
-        if (ink(d[off], d[off + 1], d[off + 2])) {
+        if (mask[y * W + c]) {
           if (s < 0) s = y;
           else if (y - last > 2) { tops.push(s); bots.push(last); allTh.push(last - s + 1); s = y; }
           last = y;
@@ -344,6 +416,19 @@
     const ink = colored
       ? function (r, g, b) { const mx = r > g ? (r > b ? r : b) : (g > b ? g : b), mn = r < g ? (r < b ? r : b) : (g < b ? g : b); return mx - mn < o.sat && mx < 160; }
       : function (r, g, b) { const mx = r > g ? (r > b ? r : b) : (g > b ? g : b), mn = r < g ? (r < b ? r : b) : (g < b ? g : b); return mx - mn >= o.sat; };
+    // "Soft" ink for the FHR panel only: also accept a MUTED/pastel colored trace where one
+    // channel dominates the other two by a clear margin (a color tint) even when overall
+    // saturation is low and the pixel is dark enough to be ink. This recovers a desaturated
+    // green maternal/MHR trace (sat ~20) that the saturation test alone drops. Used solely to
+    // build the FHR-panel mask (below), which is vertical-run filtered so scattered scanner
+    // speckle — bright, isolated — does not survive; gridline/boundary/TOCO detection stays on
+    // the strict `ink` predicate.
+    const inkSoft = colored ? ink : function (r, g, b) {
+      const mx = r > g ? (r > b ? r : b) : (g > b ? g : b), mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
+      if (mx - mn >= o.sat) return true;
+      const mid = r + g + b - mx - mn;
+      return mx - mid >= 8 && mx < 210;
+    };
     log.push("color scheme: " + (darkBg ? "dark background / colored traces" : colored ? "colored gridlines / dark traces" : "gray gridlines / colored traces"));
 
     // Panel split by trace-ink position: the FHR/TOCO boundary is the widest interior
@@ -384,7 +469,12 @@
     let scan_left = x_left, scan_right = x_right;
     if (o.crop_left != null) scan_left = o.crop_left;
     if (o.crop_right != null) scan_right = o.crop_right;
-    if (o.autocrop && o.crop_left == null && o.crop_right == null) {
+    // Drop the printed axis-number columns only when the ink predicate is ACHROMATIC (colored
+    // gridlines / dark traces, or dark background): there the black/gray numbers ARE ink and
+    // would be read as trace. In the default scheme (gray gridlines, COLORED traces) the numbers
+    // are achromatic and already excluded by the colored-ink test, so cropping them only throws
+    // away recoverable trace at the strip's start/end -- keep the full gridline span instead.
+    if (o.autocrop && o.crop_left == null && o.crop_right == null && (colored || darkBg)) {
       const pad32 = 32, bands = detectNumberBands(d, W, H, hrows[0], Math.floor(0.60 * H));
       const left = bands.filter(function (r) { return r[1] < 0.15 * W; });
       const right = bands.filter(function (r) { return r[0] > 0.85 * W; });
@@ -406,9 +496,13 @@
     // FHR panel: take one ink mask, then split it at the interior ink valley into an upper
     // (higher bpm = fetal) and lower (adult range = maternal) trace. No valley => a single
     // FHR trace, i.e. the maternal trace is simply absent (data missingness is expected).
+    // Build the FHR-panel mask from the SOFT ink (so a desaturated maternal/MHR trace is
+    // included), keeping only vertical runs >= 2 px so scanner speckle is dropped. All FHR
+    // extraction below (split, single- and two-trace) reads this mask.
     const fhrTop = fhrRows[0] - 4, fhrBot = boundary;
     const ftLo = Math.max(0, Math.floor(fhrTop)), ftHi = Math.min(H - 1, Math.ceil(fhrBot));
-    const fhrProf = rowInkProfile(d, W, H, ink, ftLo, ftHi);
+    const fhrMask = fhrPanelMask(d, W, H, ink, inkSoft, fhrTop, fhrBot);
+    const fhrProf = maskRowProfile(fhrMask, W, H, ftLo, ftHi);
     const fhrSplit = widestInteriorGap(fhrProf, ftLo, ftHi);
     const scanW = Math.max(1, scan_right - scan_left);
     const cand = [];
@@ -418,9 +512,9 @@
       cand.push({ tr: tr, mean: s / tr.rows.length, hue: meanHueAlong(d, W, tr), cov: tr.cols.length / scanW });
     };
     if (fhrSplit == null) {                               // one band -> single FHR trace (no maternal)
-      consider(traceFromMask(inkMaskBand(d, W, H, ink, fhrTop, fhrBot), W, H, scan_left, scan_right));
+      consider(traceFromMask(fhrMask, W, H, scan_left, scan_right));
     } else {                                              // two bands -> fetal (upper) + maternal (lower)
-      const tk = extractStacked(d, W, H, ink, fhrTop, fhrBot, scan_left, scan_right, fhrSplit);
+      const tk = extractStacked(fhrMask, W, H, fhrTop, fhrBot, scan_left, scan_right, fhrSplit);
       consider(tk.hi); consider(tk.lo);
     }
     // A real FHR/maternal trace spans most of the strip; drop sparse components that are
@@ -509,9 +603,9 @@
     // --- CSV ---
     let clock = null, base = 0;
     if (o.start_clock) {
-      const m = /^(\d{1,2}):(\d{2})$/.exec(o.start_clock.trim());
-      if (!m) throw new Error("start clock must look like HH:MM");
-      base = parseInt(m[1], 10) * 3600 + parseInt(m[2], 10) * 60;
+      const m = /^(\d{1,2}):(\d{2})(?::(\d{2}))?$/.exec(o.start_clock.trim());
+      if (!m) throw new Error("start clock must look like HH:MM or HH:MM:SS");
+      base = parseInt(m[1], 10) * 3600 + parseInt(m[2], 10) * 60 + (m[3] ? parseInt(m[3], 10) : 0);
       clock = function (sec) { const s = Math.round(base + sec); return p2(Math.floor(s / 3600) % 24) + ":" + p2(Math.floor(s / 60) % 60) + ":" + p2(s % 60); };
     }
     const header = (clock ? ["clock"] : []).concat(["time_s"]).concat(present);
@@ -548,6 +642,7 @@
 
   const api = {
     digitize: digitize,
+    detectHeaderCut: detectHeaderCut,
     _internal: { detectGridlines: detectGridlines, splitPanels: splitPanels, detectNumberBands: detectNumberBands, groupLines: groupLines, median: median, linmap: linmap, hueOf: hueOf },
   };
   if (typeof module !== "undefined" && module.exports) module.exports = api;

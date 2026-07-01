@@ -38,6 +38,13 @@
   a.dl { font-size:12.5px; color:var(--accent); text-decoration:none; font-weight:600; }
   details summary { cursor:pointer; font-size:12.5px; color:var(--muted); }
   pre.log { background:#0f1626; color:#cfe3ff; padding:10px 12px; border-radius:6px; font-size:11.5px; white-space:pre-wrap; margin:8px 0 0; }
+  .csvbox { max-height:340px; overflow:auto; border:1px solid var(--line); border-radius:6px; margin-top:8px; }
+  .csvbox table { border-collapse:collapse; font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; width:100%; }
+  .csvbox th, .csvbox td { padding:2px 10px; text-align:right; white-space:nowrap; border-bottom:1px solid #eef1f5; }
+  .csvbox td:first-child, .csvbox th:first-child { text-align:left; }
+  .csvbox thead th { position:sticky; top:0; background:#eef2f8; font-weight:600; border-bottom:1px solid var(--line); }
+  .csvbox tbody tr:nth-child(even) { background:#fafbfd; }
+  .csvcap { font-size:11.5px; color:var(--muted); margin-top:6px; }
 </style>
 </head>
 <body>
@@ -58,9 +65,15 @@
     <label><input type="radio" name="mode" value="ocr" checked> Auto-detect (read numbers off the strip)</label>
     <label><input type="radio" name="mode" value="standard"> Standard (240/30 bpm, 0&ndash;100 TOCO) &mdash; faster</label>
   </div>
+  <div class="opts">
+    <span>Strip duration:</span>
+    <label><input type="radio" name="dur" value="auto" checked> Auto-detect from gridlines</label>
+    <label><input type="radio" name="dur" value="fixed"> Fixed <input id="durmin" type="number" value="8" min="0.5" step="0.5" style="width:56px;font:inherit;padding:2px 5px;border:1px solid var(--line);border-radius:5px;"> min (known constraint)</label>
+  </div>
 
   <div class="bar hidden" id="bar">
     <button id="dlzip" disabled>&#8681; Download all CSVs (ZIP)</button>
+    <button id="dlpdf" class="sec" disabled>&#8681; De-identified PDF</button>
     <button id="clear" class="sec">Clear</button>
     <div class="pbar hidden" id="pbar"><i></i></div>
     <span class="muted" id="progress"></span>
@@ -82,12 +95,30 @@
   pdfjsLib.GlobalWorkerOptions.workerSrc = "vendor/pdf.worker.min.js";
   var $ = function (id) { return document.getElementById(id); };
   var fileInput = $("file"), drop = $("drop"), results = $("results");
-  var dlzip = $("dlzip"), bar = $("bar"), progress = $("progress"), pbar = $("pbar");
+  var dlzip = $("dlzip"), dlpdf = $("dlpdf"), bar = $("bar"), progress = $("progress"), pbar = $("pbar");
   function setProgress(done, total) { pbar.classList.toggle("hidden", total <= 1); pbar.firstChild.style.width = total ? Math.round(done / total * 100) + "%" : "0"; }
-  var processed = [], MAXW = 1100, S = 5, tessWorker = null;
+  var processed = [], docs = [], MAXW = 1100, S = 5, tessWorker = null;   // docs = de-identified page images for the combined PDF
   var SHOW_CAL_DETAILS = false;   // set true to re-enable the per-result "calibration details" log box
 
   function mode() { return document.querySelector('input[name=mode]:checked').value; }
+
+  // Known-duration constraint: many monitors export a FIXED page length (e.g. 8 min), which is
+  // a far more reliable span than counting gridlines. Returns minutes, or null for auto-detect.
+  function knownDuration() {
+    var el = document.querySelector('input[name=dur]:checked');
+    if (!el || el.value !== "fixed") return null;
+    var v = parseFloat($("durmin").value);
+    return (isFinite(v) && v > 0) ? v : null;
+  }
+  // persist the duration choice so a fixed constraint is set-and-forget across reloads
+  try {
+    var dm = localStorage.getItem("ctg_dur_mode"), dv = localStorage.getItem("ctg_dur_min");
+    if (dm) { var r = document.querySelector('input[name=dur][value="' + dm + '"]'); if (r) r.checked = true; }
+    if (dv) $("durmin").value = dv;
+  } catch (e) {}
+  function saveDur() { try { localStorage.setItem("ctg_dur_mode", document.querySelector('input[name=dur]:checked').value); localStorage.setItem("ctg_dur_min", $("durmin").value); } catch (e) {} }
+  Array.prototype.forEach.call(document.querySelectorAll('input[name=dur]'), function (r) { r.addEventListener("change", saveDur); });
+  $("durmin").addEventListener("input", saveDur);
 
   // Collect accepted files from a dropped entry: a file directly, or a folder's TOP-LEVEL
   // files only -- nested subfolders are intentionally not descended into.
@@ -126,18 +157,34 @@
   drop.addEventListener("dragleave", function () { drop.classList.remove("hover"); });
   drop.addEventListener("drop", function (e) { e.preventDefault(); drop.classList.remove("hover"); filesFromDrop(e.dataTransfer).then(function (files) { if (files.length) handleFiles(files); }); });
   fileInput.addEventListener("change", function () { if (fileInput.files.length) handleFiles(fileInput.files); });
-  $("clear").addEventListener("click", function () { processed = []; results.innerHTML = ""; bar.classList.add("hidden"); pbar.classList.add("hidden"); fileInput.value = ""; dlzip.disabled = true; });
+  $("clear").addEventListener("click", function () { processed = []; docs = []; results.innerHTML = ""; bar.classList.add("hidden"); pbar.classList.add("hidden"); fileInput.value = ""; dlzip.disabled = true; dlpdf.disabled = true; });
 
   function readFile(file, asBuffer) {
     return new Promise(function (res, rej) { var r = new FileReader(); r.onload = function () { res(r.result); }; r.onerror = function () { rej(new Error("could not read " + file.name)); }; if (asBuffer) r.readAsArrayBuffer(file); else r.readAsDataURL(file); });
   }
   function loadImage(u) { return new Promise(function (res, rej) { var im = new Image(); im.onload = function () { res(im); }; im.onerror = function () { rej(new Error("bad image")); }; im.src = u; }); }
   function imgToCanvas(im) { var cv = document.createElement("canvas"); cv.width = im.naturalWidth; cv.height = im.naturalHeight; cv.getContext("2d", { willReadFrequently: true }).drawImage(im, 0, 0); return cv; }
+
+  // De-identification: if a patient-identity header (name / MRN / DOB, dates) is
+  // printed above the trace, crop it off so it never reaches the preview, the OCR
+  // step, or a saved image. No-op on already-cropped strips. Returns a possibly
+  // new canvas and how many pixel rows were removed.
+  function deidentify(cv) {
+    var ctx = cv.getContext("2d", { willReadFrequently: true });
+    var d = ctx.getImageData(0, 0, cv.width, cv.height).data;
+    var cut = CTGDigitizer.detectHeaderCut(d, cv.width, cv.height);
+    if (!(cut > 0)) return { canvas: cv, removed: 0 };
+    var out = document.createElement("canvas"); out.width = cv.width; out.height = cv.height - cut;
+    out.getContext("2d", { willReadFrequently: true }).drawImage(cv, 0, cut, cv.width, out.height, 0, 0, cv.width, out.height);
+    return { canvas: out, removed: cut };
+  }
   function pdfPageToCanvas(page, scale) {
     var vp = page.getViewport({ scale: scale }); var cv = document.createElement("canvas"); cv.width = Math.round(vp.width); cv.height = Math.round(vp.height);
     var ctx = cv.getContext("2d", { willReadFrequently: true }); ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, cv.width, cv.height);
     return page.render({ canvasContext: ctx, viewport: vp }).promise.then(function () { return cv; });
   }
+  // crop any PHI header off every unit before it is displayed or digitized
+  function deidUnits(units) { units.forEach(function (u) { var r = deidentify(u.canvas); u.canvas = r.canvas; u.deid = r.removed; }); return units; }
   function unitsFromFile(file) {
     var stem = file.name.replace(/\.[^.]+$/, "") || "ctg", ext = (file.name.split(".").pop() || "").toLowerCase();
     if (ext === "pdf") {
@@ -145,13 +192,13 @@
         return pdfjsLib.getDocument({ data: new Uint8Array(buf) }).promise.then(function (pdf) {
           var units = [], chain = Promise.resolve();
           for (var p = 1; p <= pdf.numPages; p++) (function (pn) {
-            chain = chain.then(function () { return pdf.getPage(pn).then(function (pg) { return pdfPageToCanvas(pg, 2); }).then(function (cv) { units.push({ label: file.name + (pdf.numPages > 1 ? " — page " + pn : ""), csvStem: stem + (pdf.numPages > 1 ? "_p" + pn : ""), canvas: cv }); }); });
+            chain = chain.then(function () { return pdf.getPage(pn).then(function (pg) { return pdfPageToCanvas(pg, 2); }).then(function (cv) { units.push({ label: file.name + (pdf.numPages > 1 ? " — page " + pn : ""), csvStem: stem + (pdf.numPages > 1 ? "_p" + pn : ""), canvas: cv, srcName: file.name, srcStem: stem }); }); });
           })(p);
-          return chain.then(function () { return units; });
+          return chain.then(function () { return deidUnits(units); });
         });
       });
     }
-    return readFile(file, false).then(loadImage).then(function (im) { return [{ label: file.name, csvStem: stem, canvas: imgToCanvas(im) }]; });
+    return readFile(file, false).then(loadImage).then(function (im) { return deidUnits([{ label: file.name, csvStem: stem, canvas: imgToCanvas(im), srcName: file.name, srcStem: stem }]); });
   }
 
   // --- OCR auto-calibration ---
@@ -164,38 +211,93 @@
     });
     return tessWorker;
   }
-  function binarizeCrop(src, x0, x1, y0, y1) {
+  function binarizeCrop(src, x0, x1, y0, y1, thr) {
+    thr = thr || 130;
     var cw = x1 - x0, ch = y1 - y0;
     var sm = document.createElement("canvas"); sm.width = cw; sm.height = ch;
     var sx = sm.getContext("2d", { willReadFrequently: true }); sx.drawImage(src, x0, y0, cw, ch, 0, 0, cw, ch);
     var id = sx.getImageData(0, 0, cw, ch), px = id.data;
-    for (var i = 0; i < px.length; i += 4) { var mx = Math.max(px[i], px[i + 1], px[i + 2]); var v = mx < 130 ? 0 : 255; px[i] = px[i + 1] = px[i + 2] = v; px[i + 3] = 255; }
+    for (var i = 0; i < px.length; i += 4) { var mx = Math.max(px[i], px[i + 1], px[i + 2]); var v = mx < thr ? 0 : 255; px[i] = px[i + 1] = px[i + 2] = v; px[i + 3] = 255; }
     sx.putImageData(id, 0, 0);
     var big = document.createElement("canvas"); big.width = cw * S; big.height = ch * S;
     var bx = big.getContext("2d"); bx.imageSmoothingEnabled = true; bx.drawImage(sm, 0, 0, big.width, big.height);
     return big;
   }
-  function ocrCalibrate(data, W, H, src) {
+  // Normalize an OCR'd time-axis token: map common letter->digit confusions, then pull out an
+  // "HH:MM" wall-clock (any/no separator) or a bare minute label. Returns a canonical string or null.
+  function parseTimeWord(s) {
+    var t = (s || "").trim().toLowerCase().replace(/[oc]/g, "0").replace(/[li|!]/g, "1").replace(/s/g, "5").replace(/b/g, "8").replace(/z/g, "2").replace(/g/g, "9");
+    var m = t.match(/(\d{1,2})[^\d]?(\d{2})(?!\d)/);
+    if (m) { var hh = +m[1], mm = +m[2]; if (hh <= 23 && mm <= 59) return (hh < 10 ? "0" + hh : "" + hh) + ":" + (mm < 10 ? "0" + mm : "" + mm); }
+    if (/^\d{1,3}$/.test(t)) return t;      // bare minute label (e.g. synthetic 0/1/2 axes)
+    return null;
+  }
+
+  // Locate the x-axis TIME-LABEL row by content, not panel geometry: it is the row band with
+  // the most dark text spread across the CENTRE of the strip (the clock labels tile the width).
+  // Robust where the inter-panel gap ~= a gridline gap, which fools a gridline-gap panel split.
+  // Axis numbers sit in the left/right margins (excluded); gridlines are light gray (not dark);
+  // traces are colored (not dark) -- so only the dark clock text scores.
+  function findTimeBand(data, W, H, gr) {
+    var cl = Math.round(0.18 * W), cr = Math.round(0.82 * W);
+    var y0 = gr[0], y1 = Math.min(H - 1, gr[gr.length - 1] + Math.round(0.06 * H));
+    var maxRun = Math.round(0.05 * W);   // characters are short dark runs; a full-width gridline is one long run -> ignored
+    var onGrid = new Uint8Array(H);      // dashed gridlines also look like short-run text, so exclude gridline rows
+    for (var gi = 0; gi < gr.length; gi++) for (var dy = -5; dy <= 5; dy++) { var yy = gr[gi] + dy; if (yy >= 0 && yy < H) onGrid[yy] = 1; }
+    var prof = new Float64Array(H), best = 0, peak = y0;
+    for (var y = y0; y <= y1; y++) {
+      if (onGrid[y]) continue;
+      var c = 0, run = 0, off = (y * W + cl) * 4;
+      for (var x = cl; x < cr; x++, off += 4) {
+        if (Math.max(data[off], data[off + 1], data[off + 2]) < 130) run++;
+        else { if (run > 0 && run <= maxRun) c += run; run = 0; }
+      }
+      if (run > 0 && run <= maxRun) c += run;
+      prof[y] = c; if (c > best) { best = c; peak = y; }
+    }
+    if (best < Math.max(6, 0.02 * (cr - cl))) return null;      // no clear text band
+    var thr = Math.max(3, 0.3 * best), a = peak, b = peak;
+    while (a > y0 && prof[a - 1] >= thr) a--;
+    while (b < y1 && prof[b + 1] >= thr) b++;
+    // pad generously around the label band -- a too-tight crop clips ascenders/descenders and
+    // the OCR garbles (needs the full glyph height).
+    var cen = (a + b) >> 1, hh = Math.max(16, ((b - a) >> 1) + 12);
+    return [Math.max(0, cen - hh), Math.min(H, cen + hh)];
+  }
+
+  function ocrCalibrate(data, W, H, src, durMin) {
     var grid = CTGDigitizer._internal.detectGridlines(data, W, H);
     if (grid.rows.length < 4 || grid.cols.length < 2) return Promise.resolve(null);
     var pan = CTGDigitizer._internal.splitPanels(grid.rows);
     var lw = Math.round(0.15 * W), pad = Math.max(20, Math.round(0.04 * H));
     return getWorker().then(function (w) {
       function ocr(cv, wl, psm) { return w.setParameters({ tessedit_char_whitelist: wl, tessedit_pageseg_mode: psm }).then(function () { return w.recognize(cv); }).then(function (r) { return r.data.words; }); }
-      var by0 = Math.max(0, Math.round(pan.boundary - pad)), by1 = Math.min(H, Math.round(pan.boundary + pad));
+      // Locate the x-axis time-label row by content (robust); fall back to the inter-panel gap.
+      var tb = findTimeBand(data, W, H, grid.rows);
+      var fhrLast = pan.fhrRows[pan.fhrRows.length - 1], tocoFirst = pan.tocoRows[0];
+      var by0 = tb ? tb[0] : Math.max(0, Math.round(fhrLast - 0.2 * pad));
+      var by1 = tb ? tb[1] : Math.min(H, Math.round(tocoFirst + pad));
       // Restrict the axis-number OCR to the gridline panels' vertical span. On an
       // un-cropped strip the margins above/below carry patient identity (name,
       // MRN, DOB, dates); reading them would feed stray digits into the y-scale
       // fit. Axis numbers only ever sit at gridline levels, so [top..bottom
       // gridline] (+pad) captures them all and excludes the header/footer.
       var gr = grid.rows, ay0 = Math.max(0, gr[0] - pad), ay1 = Math.min(H, gr[gr.length - 1] + pad);
+      // Time labels are OCR'd WITHOUT a digit whitelist: the tiny "HH:MM EDT" clock labels read
+      // far better as free text (a digits-only pass mangles the colon), then a normalizer maps
+      // common letter/digit confusions and extracts an HH:MM (or a bare minute for synthetic
+      // 0/1/2 axes). autocal turns these into an absolute start clock via the 1-min/gridline rule.
       return ocr(binarizeCrop(src, 0, lw, ay0, ay1), "0123456789", "6").then(function (L) {
         return ocr(binarizeCrop(src, W - lw, W, ay0, ay1), "0123456789", "6").then(function (R) {
-          return ocr(binarizeCrop(src, 0, W, by0, by1), "0123456789:", "11").then(function (T) {
+          return ocr(binarizeCrop(src, 0, W, by0, by1, 145), "0123456789:.,; ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz", "6").then(function (T) {
             var yTokens = [];
             L.concat(R).forEach(function (t) { var s = t.text.trim(); if (/^\d{1,3}$/.test(s)) yTokens.push({ val: +s, y: ay0 + (t.bbox.y0 + t.bbox.y1) / 2 / S }); });
-            var timeTokens = T.map(function (t) { return { text: t.text.trim(), x: (t.bbox.x0 + t.bbox.x1) / 2 / S }; }).filter(function (t) { return /^\d{1,3}$|^\d{1,2}:\d{2}$/.test(t.text); });
-            return CTGAutoCal.buildCalibration({ hrows: grid.rows, vcols: grid.cols, W: W, H: H, yTokens: yTokens, timeTokens: timeTokens });
+            var timeTokens = [];
+            T.forEach(function (t) { var s = parseTimeWord(t.text); if (s) timeTokens.push({ text: s, x: (t.bbox.x0 + t.bbox.x1) / 2 / S }); });
+            var _c = CTGAutoCal.buildCalibration({ hrows: grid.rows, vcols: grid.cols, W: W, H: H, yTokens: yTokens, timeTokens: timeTokens, knownDurationMin: durMin });
+            _c._band = tb;                                   // pixel rows where the clock labels were read (for the highlight)
+            _c._xLeft = grid.cols[0];                        // first gridline = strip start (time 0)
+            return _c;
           });
         });
       });
@@ -205,7 +307,7 @@
   function digitizeUnit(unit, cal) {
     var w = unit.canvas.width, h = unit.canvas.height;
     var data = unit.canvas.getContext("2d", { willReadFrequently: true }).getImageData(0, 0, w, h).data;
-    var opts = cal ? { fhr_cal: cal.fhr_cal, toco_cal: cal.toco_cal, start_min: cal.start_min, end_min: cal.end_min } : {};
+    var opts = cal ? { fhr_cal: cal.fhr_cal, toco_cal: cal.toco_cal, start_min: cal.start_min, end_min: cal.end_min, start_clock: cal.start_clock } : {};
     return { res: CTGDigitizer.digitize(data, w, h, opts), data: data };
   }
 
@@ -214,12 +316,17 @@
   function badge(text, cls) { var b = document.createElement("span"); b.className = "badge " + cls; b.textContent = text; return b; }
 
   function renderCard(unit, out, cal, err) {
+    // Collect the de-identified page image (header already cropped) for the per-file PDF export —
+    // every real page, whether or not its traces digitized, tagged with its SOURCE file so the
+    // export keeps one PDF per uploaded file.
+    if (unit.canvas && unit.canvas.width > 1 && unit.canvas.height > 1) docs.push({ img: canvasJpeg(unit.canvas), stem: unit.srcStem || "ctg", name: unit.srcName || "" });
     var card = document.createElement("div"); card.className = "card";
     var h3 = document.createElement("h3"); h3.textContent = unit.label; card.appendChild(h3);
     if (err) { var e = document.createElement("div"); e.className = "badges"; e.appendChild(badge("could not digitize: " + err.message, "bad")); card.appendChild(e); results.insertBefore(card, results.firstChild); return; }
     var res = out.res;
 
     var badges = document.createElement("div"); badges.className = "badges";
+    if (unit.deid) badges.appendChild(badge("🔒 patient header cropped (de-identified)", "ok"));
     badges.appendChild(badge(res.nrows + " rows", "ok"));
     badges.appendChild(badge(res.present.join(", "), "ok"));
     var fs = res.calibration.fhr.source, ts = res.calibration.toco.source;
@@ -232,14 +339,60 @@
 
     var w = unit.canvas.width, h = unit.canvas.height, s = Math.min(1, MAXW / w);
     var disp = document.createElement("canvas"); disp.width = Math.round(w * s); disp.height = Math.round(h * s);
-    var dctx = disp.getContext("2d"); dctx.drawImage(unit.canvas, 0, 0, disp.width, disp.height); dctx.fillStyle = "#e8000b";
+    var dctx = disp.getContext("2d"); dctx.drawImage(unit.canvas, 0, 0, disp.width, disp.height);
+    // Highlight where the START timestamp was read: yellow band = the x-axis clock-label row,
+    // magenta line = the first gridline (= strip start / time 0). Lets the user eyeball whether
+    // the auto-decoded start below is right before trusting/overriding it.
+    if (cal && cal._band) {
+      dctx.save();
+      dctx.fillStyle = "rgba(255,205,0,0.30)"; dctx.fillRect(0, cal._band[0] * s, disp.width, (cal._band[1] - cal._band[0]) * s);
+      var xl = (cal._xLeft || 0) * s; dctx.strokeStyle = "#c000c0"; dctx.lineWidth = 2; dctx.beginPath(); dctx.moveTo(xl, 0); dctx.lineTo(xl, disp.height); dctx.stroke();
+      dctx.restore();
+    }
+    dctx.fillStyle = "#e8000b";
     for (var k = 0; k < res.present.length; k++) { var ov = res.overlay[res.present[k]]; for (var j = 0; j < ov.cols.length; j++) dctx.fillRect(ov.cols[j] * s, (ov.rows[j] - 5) * s, Math.max(1, s), Math.max(1.3, 1.6 * s)); }  // marker drawn slightly above the line (visual only; CSV uses the true row)
     card.appendChild(disp);
 
-    var name = uniqueName(unit.csvStem); processed.push({ csvName: name, csv: res.csv });
-    var row = document.createElement("div"); row.style.marginTop = "8px";
+    var name = uniqueName(unit.csvStem);
+    var startSec0 = roundToMin(cal && cal.start_clock ? parseClockToSec(cal.start_clock) : null);   // start is minute-granularity (PDF has no seconds)
+    var entry = { csvName: name, csv: res.csv, startSec: startSec0 };   // startSec drives the CSV's absolute clock column
+    processed.push(entry);
+
+    // Human override: confirm or correct the auto-decoded strip start time (HH:MM).
+    var tsRow = document.createElement("div"); tsRow.style.margin = "10px 0 2px"; tsRow.style.fontSize = "12.5px";
+    var lab = document.createElement("span"); lab.textContent = "Start time (HH:MM): "; lab.style.color = "var(--muted)";
+    var inp = document.createElement("input"); inp.type = "text"; inp.value = startSec0 != null ? secToHM(startSec0) : "";
+    inp.placeholder = "e.g. 03:46"; inp.style.cssText = "font:inherit;width:80px;padding:3px 6px;border:1px solid var(--line);border-radius:5px;";
+    var note = document.createElement("span"); note.style.marginLeft = "8px";
+    function setNote(t, c) { note.textContent = t; note.style.color = c; }
+    setNote(startSec0 != null ? "auto-read from x-axis — confirm or edit (highlighted above)" : "not read — type the strip's start time to add timestamps", "var(--muted)");
+    inp.addEventListener("input", function () {
+      var v = inp.value.trim();
+      if (v === "") { entry.startSec = null; inp.style.borderColor = "var(--line)"; setNote("no timestamps in CSV", "var(--muted)"); }
+      else { var sec = roundToMin(parseClockToSec(v));
+        if (sec == null) { inp.style.borderColor = "var(--bad)"; setNote("use HH:MM (e.g. 03:46)", "var(--bad)"); }
+        else { entry.startSec = sec; inp.style.borderColor = "var(--ok)"; setNote(sec === startSec0 ? "confirmed" : "overridden ✎ — applied on download / preview", "var(--ok)"); }
+      }
+      if (!prev.classList.contains("hidden")) refreshPreview();   // keep an open CSV preview in sync
+    });
+    tsRow.appendChild(lab); tsRow.appendChild(inp); tsRow.appendChild(note); card.appendChild(tsRow);
+
+    var row = document.createElement("div"); row.style.marginTop = "6px";
     var a = document.createElement("a"); a.className = "dl"; a.href = "#"; a.textContent = "↓ download " + name;
-    a.addEventListener("click", function (e) { e.preventDefault(); saveCsv(name, res.csv); }); row.appendChild(a); card.appendChild(row);
+    a.addEventListener("click", function (e) { e.preventDefault(); saveCsv(name, csvWithStart(entry.csv, entry.startSec)); });
+    var insp = document.createElement("a"); insp.className = "dl"; insp.href = "#"; insp.textContent = "⤢ inspect CSV"; insp.style.marginLeft = "18px";
+    var prev = document.createElement("div"); prev.className = "csvbox hidden";
+    function refreshPreview() {
+      var text = csvWithStart(entry.csv, entry.startSec), n = text.replace(/\n$/, "").split("\n").length - 1;
+      prev.innerHTML = ""; var cap = document.createElement("div"); cap.className = "csvcap"; cap.textContent = n + " rows" + (entry.startSec != null ? " · timestamps from start " + secToHM(entry.startSec) : " · no timestamps (set a start time above)");
+      prev.appendChild(cap); prev.appendChild(buildCsvTable(text));
+    }
+    insp.addEventListener("click", function (e) {
+      e.preventDefault();
+      if (prev.classList.contains("hidden")) { refreshPreview(); prev.classList.remove("hidden"); insp.textContent = "× hide CSV"; }
+      else { prev.classList.add("hidden"); insp.textContent = "⤢ inspect CSV"; }
+    });
+    row.appendChild(a); row.appendChild(insp); card.appendChild(row); card.appendChild(prev);
 
     if (SHOW_CAL_DETAILS) {
       var det = document.createElement("details"); var sum = document.createElement("summary"); sum.textContent = "calibration details"; det.appendChild(sum);
@@ -250,12 +403,82 @@
     results.insertBefore(card, results.firstChild);
   }
 
+  // --- absolute-timestamp helpers (with human override) ---
+  function p2n(n) { return n < 10 ? "0" + n : "" + n; }
+  function parseClockToSec(str) {                 // "3:46" | "03:46" | "03:46:06" -> seconds-of-day, or null
+    var m = /^\s*(\d{1,2}):(\d{2})(?::(\d{2}))?\s*$/.exec(str || "");
+    if (!m) return null;
+    var hh = +m[1], mm = +m[2], ss = m[3] ? +m[3] : 0;
+    if (hh > 23 || mm > 59 || ss > 59) return null;
+    return hh * 3600 + mm * 60 + ss;
+  }
+  function secToClock(sec) { var s = Math.round(((sec % 86400) + 86400) % 86400); return p2n(Math.floor(s / 3600)) + ":" + p2n(Math.floor((s % 3600) / 60)) + ":" + p2n(s % 60); }
+  // start time is only known to the minute (the PDF labels have no seconds), so display/round it as HH:MM
+  function roundToMin(sec) { return sec == null ? null : Math.round(sec / 60) * 60; }
+  function secToHM(sec) { var s = ((Math.round(sec / 60) % 1440) + 1440) % 1440; return p2n(Math.floor(s / 60)) + ":" + p2n(s % 60); }
+  // Build a scrollable HTML table from CSV text (for in-browser inspection).
+  function buildCsvTable(csvText) {
+    var lines = csvText.replace(/\n$/, "").split("\n");
+    var tbl = document.createElement("table");
+    var thead = document.createElement("thead"), htr = document.createElement("tr");
+    lines[0].split(",").forEach(function (h) { var th = document.createElement("th"); th.textContent = h; htr.appendChild(th); });
+    thead.appendChild(htr); tbl.appendChild(thead);
+    var tb = document.createElement("tbody");
+    for (var i = 1; i < lines.length; i++) { var tr = document.createElement("tr"); lines[i].split(",").forEach(function (c) { var td = document.createElement("td"); td.textContent = c; tr.appendChild(td); }); tb.appendChild(tr); }
+    tbl.appendChild(tb); return tbl;
+  }
+  // Rebuild a CSV's leading absolute "clock" column from a start-of-strip time (seconds-of-day).
+  // Works whether the CSV already has a clock column or not; startSec==null leaves it unchanged.
+  function csvWithStart(csv, startSec) {
+    if (startSec == null) return csv;
+    var lines = csv.replace(/\n$/, "").split("\n"), hdr = lines[0].split(",");
+    var hasClock = hdr[0] === "clock", tIdx = hasClock ? 1 : 0;
+    if (hdr[tIdx] !== "time_s") return csv;       // unexpected shape; leave as-is
+    var out = [(hasClock ? hdr : ["clock"].concat(hdr)).join(",")];
+    for (var i = 1; i < lines.length; i++) {
+      var c = lines[i].split(","), ts = parseFloat(c[tIdx]);
+      var rest = hasClock ? c.slice(1) : c;
+      out.push([isFinite(ts) ? secToClock(startSec + ts) : "nan"].concat(rest).join(","));
+    }
+    return out.join("\n") + "\n";
+  }
+
   function saveCsv(name, text) { var b = new Blob([text], { type: "text/csv" }); var a = document.createElement("a"); a.href = URL.createObjectURL(b); a.download = name; document.body.appendChild(a); a.click(); document.body.removeChild(a); setTimeout(function () { URL.revokeObjectURL(a.href); }, 1000); }
+
+  // --- single-PDF export of the de-identified page images (no external library) ---
+  function canvasJpeg(cv) { var url = cv.toDataURL("image/jpeg", 0.85), bin = atob(url.slice(url.indexOf(",") + 1)), a = new Uint8Array(bin.length); for (var i = 0; i < bin.length; i++) a[i] = bin.charCodeAt(i); return { bytes: a, w: cv.width, h: cv.height }; }
+  // Assemble [{bytes:jpeg, w, h}] into one PDF (one image per page). Builds the object table and
+  // xref by hand and embeds each JPEG as a DCTDecode image XObject.
+  function imagesToPdf(imgs) {
+    var enc = function (s) { var a = new Uint8Array(s.length); for (var i = 0; i < s.length; i++) a[i] = s.charCodeAt(i) & 0xff; return a; };
+    var chunks = [], offset = 0, offs = [];
+    function put(u8) { chunks.push(u8); offset += u8.length; }
+    function puts(s) { put(enc(s)); }
+    var N = imgs.length, totalObjs = 2 + 3 * N, pageNums = [];
+    for (var i = 0; i < N; i++) pageNums.push(5 + 3 * i);
+    puts("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+    offs[1] = offset; puts("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    offs[2] = offset; puts("2 0 obj\n<< /Type /Pages /Kids [" + pageNums.map(function (n) { return n + " 0 R"; }).join(" ") + "] /Count " + N + " >>\nendobj\n");
+    for (var i = 0; i < N; i++) {
+      var imgN = 3 + 3 * i, contN = 4 + 3 * i, pageN = 5 + 3 * i, it = imgs[i];
+      offs[imgN] = offset;
+      puts(imgN + " 0 obj\n<< /Type /XObject /Subtype /Image /Width " + it.w + " /Height " + it.h + " /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length " + it.bytes.length + " >>\nstream\n");
+      put(it.bytes); puts("\nendstream\nendobj\n");
+      var content = "q " + it.w + " 0 0 " + it.h + " 0 0 cm /Im0 Do Q\n";
+      offs[contN] = offset; puts(contN + " 0 obj\n<< /Length " + content.length + " >>\nstream\n" + content + "endstream\nendobj\n");
+      offs[pageN] = offset; puts(pageN + " 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 " + it.w + " " + it.h + "] /Resources << /XObject << /Im0 " + imgN + " 0 R >> >> /Contents " + contN + " 0 R >>\nendobj\n");
+    }
+    var xrefStart = offset, xref = "xref\n0 " + (totalObjs + 1) + "\n0000000000 65535 f \n";
+    for (var n = 1; n <= totalObjs; n++) xref += ("0000000000" + (offs[n] || 0)).slice(-10) + " 00000 n \n";
+    puts(xref); puts("trailer\n<< /Size " + (totalObjs + 1) + " /Root 1 0 R >>\nstartxref\n" + xrefStart + "\n%%EOF\n");
+    var out = new Uint8Array(offset), p = 0; for (var c = 0; c < chunks.length; c++) { out.set(chunks[c], p); p += chunks[c].length; }
+    return new Blob([out], { type: "application/pdf" });
+  }
   var yield_ = function () { return new Promise(function (r) { setTimeout(r, 0); }); };
 
   function handleFiles(fileList) {
     bar.classList.remove("hidden"); dlzip.disabled = true;
-    var files = Array.prototype.slice.call(fileList), done = 0, total = files.length, useOcr = mode() === "ocr";
+    var files = Array.prototype.slice.call(fileList), done = 0, total = files.length, useOcr = mode() === "ocr", durMin = knownDuration();
     setProgress(0, total);
     progress.textContent = useOcr ? "processing (auto-detect scale)…" : "processing…";
     var chain = Promise.resolve();
@@ -267,9 +490,11 @@
             c = c.then(yield_).then(function () {
               var w = unit.canvas.width, h = unit.canvas.height;
               var data = unit.canvas.getContext("2d", { willReadFrequently: true }).getImageData(0, 0, w, h).data;
-              var calP = useOcr ? ocrCalibrate(data, w, h, unit.canvas).catch(function () { return null; }) : Promise.resolve(null);
+              var calP = useOcr ? ocrCalibrate(data, w, h, unit.canvas, durMin).catch(function () { return null; }) : Promise.resolve(null);
               return calP.then(function (cal) {
-                var out; try { out = { res: CTGDigitizer.digitize(data, w, h, cal ? { fhr_cal: cal.fhr_cal, toco_cal: cal.toco_cal, start_min: cal.start_min, end_min: cal.end_min } : {}) }; } catch (e) { renderCard(unit, null, cal, e); return; }
+                var opts = cal ? { fhr_cal: cal.fhr_cal, toco_cal: cal.toco_cal, start_min: cal.start_min, end_min: cal.end_min, start_clock: cal.start_clock } : {};
+                if (durMin != null) opts.end_min = durMin;   // known fixed strip duration overrides the gridline/OCR span
+                var out; try { out = { res: CTGDigitizer.digitize(data, w, h, opts) }; } catch (e) { renderCard(unit, null, cal, e); return; }
                 renderCard(unit, out, cal, null);
               });
             });
@@ -278,16 +503,38 @@
         }).catch(function (e) { renderCard({ label: file.name, csvStem: "x", canvas: document.createElement("canvas") }, null, null, e); }).then(function () { done++; setProgress(done, total); progress.textContent = "processed " + done + " / " + total + " (" + Math.round(done / total * 100) + "%)"; });
       });
     });
-    chain.then(function () { var ok = processed.length; progress.textContent = "done · " + ok + " CSV" + (ok === 1 ? "" : "s") + " ready" + (done < total ? " (" + (total - done) + " file errors)" : ""); dlzip.disabled = ok === 0; });
+    chain.then(function () { var ok = processed.length; progress.textContent = "done · " + ok + " CSV" + (ok === 1 ? "" : "s") + " ready" + (done < total ? " (" + (total - done) + " file errors)" : ""); dlzip.disabled = ok === 0; dlpdf.disabled = docs.length === 0; });
   }
 
   dlzip.addEventListener("click", function () {
-    if (!processed.length) return; var zip = new JSZip(); processed.forEach(function (p) { zip.file(p.csvName, p.csv); });
+    if (!processed.length) return; var zip = new JSZip(); processed.forEach(function (p) { zip.file(p.csvName, csvWithStart(p.csv, p.startSec)); });   // apply any per-strip start-time override
     dlzip.disabled = true; dlzip.textContent = "zipping…";
     zip.generateAsync({ type: "blob", compression: "DEFLATE" }).then(function (blob) {
       var a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "ctg_csvs.zip"; document.body.appendChild(a); a.click(); document.body.removeChild(a);
       setTimeout(function () { URL.revokeObjectURL(a.href); }, 2000); dlzip.disabled = false; dlzip.innerHTML = "↓ Download all CSVs (ZIP)";
     });
+  });
+
+  function download(blob, name) { var a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = name; document.body.appendChild(a); a.click(); document.body.removeChild(a); setTimeout(function () { URL.revokeObjectURL(a.href); }, 2000); }
+  dlpdf.addEventListener("click", function () {
+    if (!docs.length) return;
+    dlpdf.disabled = true; var lbl = dlpdf.innerHTML; dlpdf.textContent = "building PDF…";
+    setTimeout(function () {   // yield so the button state paints before the (sync) PDF build
+      try {
+        // Group pages by SOURCE file (preserving upload/page order) -> one PDF per input file,
+        // keeping the original structure instead of merging everything into one document.
+        var groups = [], byStem = {};
+        docs.forEach(function (d) { var k = d.stem; if (!(k in byStem)) { byStem[k] = groups.length; groups.push({ stem: k, imgs: [] }); } groups[byStem[k]].imgs.push(d.img); });
+        if (groups.length === 1) {
+          download(imagesToPdf(groups[0].imgs), groups[0].stem + "_deid.pdf");
+          dlpdf.disabled = false; dlpdf.innerHTML = lbl;
+        } else {
+          var zip = new JSZip(), taken = {};
+          groups.forEach(function (g) { var nm = g.stem + "_deid.pdf", i = 2; while (taken[nm]) { nm = g.stem + "_" + i + "_deid.pdf"; i++; } taken[nm] = 1; zip.file(nm, imagesToPdf(g.imgs)); });
+          zip.generateAsync({ type: "blob" }).then(function (blob) { download(blob, "ctg_deidentified_pdfs.zip"); dlpdf.disabled = false; dlpdf.innerHTML = lbl; });
+        }
+      } catch (e) { alert("Could not build PDF: " + e.message); dlpdf.disabled = false; dlpdf.innerHTML = lbl; }
+    }, 30);
   });
 })();
 </script>

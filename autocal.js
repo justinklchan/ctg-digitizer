@@ -97,19 +97,46 @@
     return null;
   }
 
-  function fitTime(timeTokens, x_left, x_right, warnings) {
+  function p2(n) { return n < 10 ? "0" + n : "" + n; }
+
+  function clockStr(minOfDay) {
+    let secs = Math.round((((minOfDay % 1440) + 1440) % 1440) * 60);
+    secs = ((secs % 86400) + 86400) % 86400;
+    return p2(Math.floor(secs / 3600)) + ":" + p2(Math.floor((secs % 3600) / 60)) + ":" + p2(secs % 60);
+  }
+
+  function fitTime(timeTokens, vcols, warnings, knownDurationMin) {
+    const x_left = vcols[0], x_right = vcols[vcols.length - 1], px = x_right - x_left;
     const pts = [];
     (timeTokens || []).forEach(function (t) {
       const v = parseTime(t.text);
-      if (v != null) pts.push({ p: t.x, v: v });
+      if (v != null) pts.push({ p: t.x, v: v, clock: /^\d{1,2}:\d{2}$/.test(t.text.trim()) });
     });
-    if (pts.length < 2) { warnings.push("time: <2 readable time labels -> 1-min/gridline assumption"); return { start_min: 0, end_min: null, source: "standard" }; }
+    const clockPts = pts.filter(function (p) { return p.clock; });
+
+    // ABSOLUTE wall-clock from the x-axis labels. A label's elapsed minutes = its fraction of the
+    // way across the strip times the strip DURATION; each readable "HH:MM" label then implies a
+    // start-of-strip minute-of-day (value minus elapsed) and the MEDIAN is robust to the many
+    // mis-OCR'd labels (tiny colon text reads poorly). Minutes-per-pixel comes from the KNOWN
+    // fixed duration when supplied (robust regardless of gridline density) -- otherwise from the
+    // 1-minute-per-gridline assumption, which breaks if faint minor gridlines are also detected.
+    if (clockPts.length >= 2 && px > 0) {
+      const gs = medianSpacing(vcols);
+      const minPerPx = (knownDurationMin && knownDurationMin > 0) ? knownDurationMin / px : (gs > 0 ? 1 / gs : 0);
+      if (minPerPx > 0) {
+        const starts = clockPts.map(function (p) { return p.v - (p.p - x_left) * minPerPx; });  // minute-of-day at x_left
+        const s0 = median(starts);
+        return { start_min: 0, end_min: px * minPerPx, start_clock: clockStr(s0), source: "ocr" };
+      }
+    }
+
+    // Non-clock axis (e.g. synthetic strips labelled 0,1,2 minutes): fit x->minutes directly.
+    if (pts.length < 2) { warnings.push("time: <2 readable time labels -> 1-min/gridline assumption"); return { start_min: 0, end_min: null, start_clock: null, source: "standard" }; }
     const fit = theilSen(pts);
-    if (!fit || Math.abs(fit.a) < 1e-9) { warnings.push("time: degenerate time fit -> 1-min/gridline assumption"); return { start_min: 0, end_min: null, source: "standard" }; }
-    // express as minutes from the left edge (start at 0)
+    if (!fit || Math.abs(fit.a) < 1e-9) { warnings.push("time: degenerate time fit -> 1-min/gridline assumption"); return { start_min: 0, end_min: null, start_clock: null, source: "standard" }; }
     const span = fit.a * (x_right - x_left);
-    if (span <= 0) { warnings.push("time: non-increasing time -> 1-min/gridline assumption"); return { start_min: 0, end_min: null, source: "standard" }; }
-    return { start_min: 0, end_min: span, source: "ocr" };
+    if (span <= 0) { warnings.push("time: non-increasing time -> 1-min/gridline assumption"); return { start_min: 0, end_min: null, start_clock: null, source: "standard" }; }
+    return { start_min: 0, end_min: span, start_clock: null, source: "ocr" };
   }
 
   function buildCalibration(input) {
@@ -121,12 +148,11 @@
 
     const fhr = fitPanel(fhrTok, panels.fhrRows, true, warnings, "FHR");
     const toco = fitPanel(tocoTok, panels.tocoRows, true, warnings, "TOCO");
-    const x_left = input.vcols[0], x_right = input.vcols[input.vcols.length - 1];
-    const time = fitTime(input.timeTokens, x_left, x_right, warnings);
+    const time = fitTime(input.timeTokens, input.vcols, warnings, input.knownDurationMin);
 
     return {
       fhr_cal: fhr.cal, toco_cal: toco.cal,
-      start_min: time.start_min, end_min: time.end_min,
+      start_min: time.start_min, end_min: time.end_min, start_clock: time.start_clock,
       fhrSource: fhr.source, tocoSource: toco.source, timeSource: time.source,
       warnings: warnings, panels: panels,
     };
