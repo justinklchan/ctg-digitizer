@@ -536,7 +536,13 @@
     // deviation (bpm / TOCO units) tolerated, so a flat, tight baseline isn't over-trimmed.
     function despike(cols, rows, conv, floor) {
       const n = rows.length; if (n < 8) return { cols: cols, rows: rows };
-      const half = Math.min(60, n >> 2), K = 4, val = new Array(n);  // wide enough to resist dense spike bursts
+      // Local Hampel window. It must be NARROWER than the narrowest genuine excursion (a contraction
+      // or deceleration is tens of px wide) so the rolling median TRACKS the feature and its apex is
+      // kept. A window as wide as the whole trace makes a sharp peak a minority of its own window, so
+      // the median sits at baseline and the peak's tip is wrongly deleted as a "spike" -- the false
+      // negatives seen at acceleration/contraction apexes. ~16 px still leaves an isolated annotation
+      // mark a small minority of the window, so stray text/arrow marks are still removed.
+      const half = Math.max(6, Math.min(16, n >> 2)), K = 4, val = new Array(n);
       for (let i = 0; i < n; i++) val[i] = conv(rows[i]);
       const oc = [], orow = [], win = [], dev = [];
       for (let i = 0; i < n; i++) {
