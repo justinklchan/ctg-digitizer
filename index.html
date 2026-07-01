@@ -72,14 +72,18 @@
   </div>
 
   <div class="bar hidden" id="bar">
-    <button id="dlzip" disabled>&#8681; Download all CSVs (ZIP)</button>
-    <button id="dlpdf" class="sec" disabled>&#8681; De-identified PDF</button>
+    <button class="dlall-btn" disabled>&#8681; Download all (CSVs + de-identified PDFs)</button>
     <button id="clear" class="sec">Clear</button>
     <div class="pbar hidden" id="pbar"><i></i></div>
     <span class="muted" id="progress"></span>
   </div>
 
   <div id="results"></div>
+
+  <div class="bar hidden" id="barBottom">
+    <button class="dlall-btn" disabled>&#8681; Download all (CSVs + de-identified PDFs)</button>
+    <span class="muted" id="progressBottom"></span>
+  </div>
 
   <div class="muted" style="margin-top:18px;">Auto-detect reads the printed axis numbers (OCR) and falls back to the standard scale per-axis when a strip's labels can't be read reliably &mdash; the badges on each result say which was used. The red dots show the extracted trace; check they sit on the lines.</div>
 </main>
@@ -95,7 +99,14 @@
   pdfjsLib.GlobalWorkerOptions.workerSrc = "vendor/pdf.worker.min.js";
   var $ = function (id) { return document.getElementById(id); };
   var fileInput = $("file"), drop = $("drop"), results = $("results");
-  var dlzip = $("dlzip"), dlpdf = $("dlpdf"), bar = $("bar"), progress = $("progress"), pbar = $("pbar");
+  var bar = $("bar"), barBottom = $("barBottom"), progress = $("progress"), progressBottom = $("progressBottom"), pbar = $("pbar");
+  // One "download all" button appears at both the top and bottom of the page (so a long results
+  // list needn't be scrolled back up); both are the same action and are enabled/relabelled together.
+  var dlBtns = Array.prototype.slice.call(document.querySelectorAll(".dlall-btn"));
+  function dlEnabled(en) { dlBtns.forEach(function (b) { b.disabled = !en; }); }
+  function dlLabel(html) { dlBtns.forEach(function (b) { b.innerHTML = html; }); }
+  function setBarsHidden(hidden) { bar.classList.toggle("hidden", hidden); barBottom.classList.toggle("hidden", hidden); }
+  function setStatus(t) { progress.textContent = t; progressBottom.textContent = t; }
   function setProgress(done, total) { pbar.classList.toggle("hidden", total <= 1); pbar.firstChild.style.width = total ? Math.round(done / total * 100) + "%" : "0"; }
   var processed = [], docs = [], MAXW = 1100, S = 5, tessWorker = null;   // docs = de-identified page images for the combined PDF
   var SHOW_CAL_DETAILS = false;   // set true to re-enable the per-result "calibration details" log box
@@ -157,7 +168,7 @@
   drop.addEventListener("dragleave", function () { drop.classList.remove("hover"); });
   drop.addEventListener("drop", function (e) { e.preventDefault(); drop.classList.remove("hover"); filesFromDrop(e.dataTransfer).then(function (files) { if (files.length) handleFiles(files); }); });
   fileInput.addEventListener("change", function () { if (fileInput.files.length) handleFiles(fileInput.files); });
-  $("clear").addEventListener("click", function () { processed = []; docs = []; results.innerHTML = ""; bar.classList.add("hidden"); pbar.classList.add("hidden"); fileInput.value = ""; dlzip.disabled = true; dlpdf.disabled = true; });
+  $("clear").addEventListener("click", function () { processed = []; docs = []; results.innerHTML = ""; setBarsHidden(true); pbar.classList.add("hidden"); fileInput.value = ""; dlEnabled(false); });
 
   function readFile(file, asBuffer) {
     return new Promise(function (res, rej) { var r = new FileReader(); r.onload = function () { res(r.result); }; r.onerror = function () { rej(new Error("could not read " + file.name)); }; if (asBuffer) r.readAsArrayBuffer(file); else r.readAsDataURL(file); });
@@ -477,10 +488,10 @@
   var yield_ = function () { return new Promise(function (r) { setTimeout(r, 0); }); };
 
   function handleFiles(fileList) {
-    bar.classList.remove("hidden"); dlzip.disabled = true;
+    setBarsHidden(false); dlEnabled(false);
     var files = Array.prototype.slice.call(fileList), done = 0, total = files.length, useOcr = mode() === "ocr", durMin = knownDuration();
     setProgress(0, total);
-    progress.textContent = useOcr ? "processing (auto-detect scale)…" : "processing…";
+    setStatus(useOcr ? "processing (auto-detect scale)…" : "processing…");
     var chain = Promise.resolve();
     files.forEach(function (file) {
       chain = chain.then(function () {
@@ -500,42 +511,37 @@
             });
           });
           return c;
-        }).catch(function (e) { renderCard({ label: file.name, csvStem: "x", canvas: document.createElement("canvas") }, null, null, e); }).then(function () { done++; setProgress(done, total); progress.textContent = "processed " + done + " / " + total + " (" + Math.round(done / total * 100) + "%)"; });
+        }).catch(function (e) { renderCard({ label: file.name, csvStem: "x", canvas: document.createElement("canvas") }, null, null, e); }).then(function () { done++; setProgress(done, total); setStatus("processed " + done + " / " + total + " (" + Math.round(done / total * 100) + "%)"); });
       });
     });
-    chain.then(function () { var ok = processed.length; progress.textContent = "done · " + ok + " CSV" + (ok === 1 ? "" : "s") + " ready" + (done < total ? " (" + (total - done) + " file errors)" : ""); dlzip.disabled = ok === 0; dlpdf.disabled = docs.length === 0; });
+    chain.then(function () { var ok = processed.length; setStatus("done · " + ok + " CSV" + (ok === 1 ? "" : "s") + " ready" + (done < total ? " (" + (total - done) + " file errors)" : "")); dlEnabled(ok > 0 || docs.length > 0); });
   }
 
-  dlzip.addEventListener("click", function () {
-    if (!processed.length) return; var zip = new JSZip(); processed.forEach(function (p) { zip.file(p.csvName, csvWithStart(p.csv, p.startSec)); });   // apply any per-strip start-time override
-    dlzip.disabled = true; dlzip.textContent = "zipping…";
-    zip.generateAsync({ type: "blob", compression: "DEFLATE" }).then(function (blob) {
-      var a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "ctg_csvs.zip"; document.body.appendChild(a); a.click(); document.body.removeChild(a);
-      setTimeout(function () { URL.revokeObjectURL(a.href); }, 2000); dlzip.disabled = false; dlzip.innerHTML = "↓ Download all CSVs (ZIP)";
-    });
-  });
-
   function download(blob, name) { var a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = name; document.body.appendChild(a); a.click(); document.body.removeChild(a); setTimeout(function () { URL.revokeObjectURL(a.href); }, 2000); }
-  dlpdf.addEventListener("click", function () {
-    if (!docs.length) return;
-    dlpdf.disabled = true; var lbl = dlpdf.innerHTML; dlpdf.textContent = "building PDF…";
-    setTimeout(function () {   // yield so the button state paints before the (sync) PDF build
+
+  // Single action: bundle every result into ONE ZIP — all CSVs under csvs/ (with any per-strip
+  // start-time override applied) and the de-identified page images as one PDF per source file
+  // under deidentified_pdfs/. Wired to the button at both the top and bottom of the page.
+  function downloadAll() {
+    if (!processed.length && !docs.length) return;
+    dlEnabled(false); var lbl = "&#8681; Download all (CSVs + de-identified PDFs)"; dlLabel("packaging…");
+    setTimeout(function () {   // yield so the disabled/label state paints before the (sync) PDF build
       try {
-        // Group pages by SOURCE file (preserving upload/page order) -> one PDF per input file,
-        // keeping the original structure instead of merging everything into one document.
-        var groups = [], byStem = {};
+        var zip = new JSZip();
+        var csvDir = zip.folder("csvs");
+        processed.forEach(function (p) { csvDir.file(p.csvName, csvWithStart(p.csv, p.startSec)); });   // apply any per-strip start-time override
+        // Group de-identified pages by SOURCE file (preserving upload/page order) -> one PDF per
+        // input file, keeping the original structure instead of merging everything into one document.
+        var pdfDir = zip.folder("deidentified_pdfs"), groups = [], byStem = {}, taken = {};
         docs.forEach(function (d) { var k = d.stem; if (!(k in byStem)) { byStem[k] = groups.length; groups.push({ stem: k, imgs: [] }); } groups[byStem[k]].imgs.push(d.img); });
-        if (groups.length === 1) {
-          download(imagesToPdf(groups[0].imgs), groups[0].stem + "_deid.pdf");
-          dlpdf.disabled = false; dlpdf.innerHTML = lbl;
-        } else {
-          var zip = new JSZip(), taken = {};
-          groups.forEach(function (g) { var nm = g.stem + "_deid.pdf", i = 2; while (taken[nm]) { nm = g.stem + "_" + i + "_deid.pdf"; i++; } taken[nm] = 1; zip.file(nm, imagesToPdf(g.imgs)); });
-          zip.generateAsync({ type: "blob" }).then(function (blob) { download(blob, "ctg_deidentified_pdfs.zip"); dlpdf.disabled = false; dlpdf.innerHTML = lbl; });
-        }
-      } catch (e) { alert("Could not build PDF: " + e.message); dlpdf.disabled = false; dlpdf.innerHTML = lbl; }
+        groups.forEach(function (g) { var nm = (g.stem || "ctg") + "_deid.pdf", i = 2; while (taken[nm]) { nm = (g.stem || "ctg") + "_" + i + "_deid.pdf"; i++; } taken[nm] = 1; pdfDir.file(nm, imagesToPdf(g.imgs)); });
+        zip.generateAsync({ type: "blob", compression: "DEFLATE" }).then(function (blob) {
+          download(blob, "ctg_export.zip"); dlEnabled(true); dlLabel(lbl);
+        }, function (e) { alert("Could not build export: " + e.message); dlEnabled(true); dlLabel(lbl); });
+      } catch (e) { alert("Could not build export: " + e.message); dlEnabled(true); dlLabel(lbl); }
     }, 30);
-  });
+  }
+  dlBtns.forEach(function (b) { b.addEventListener("click", downloadAll); });
 })();
 </script>
 </body>
