@@ -70,6 +70,9 @@
     <label><input type="radio" name="dur" value="auto" checked> Auto-detect from gridlines</label>
     <label><input type="radio" name="dur" value="fixed"> Fixed <input id="durmin" type="number" value="8" min="0.5" step="0.5" style="width:56px;font:inherit;padding:2px 5px;border:1px solid var(--line);border-radius:5px;"> min (known constraint)</label>
   </div>
+  <div class="opts">
+    <label><input type="checkbox" id="showlabels"> Show decoded value labels on the trace (debug: time &amp; value)</label>
+  </div>
 
   <div class="bar hidden" id="bar">
     <button class="dlall-btn" disabled>&#8681; Download all (CSVs + de-identified PDFs)</button>
@@ -110,8 +113,29 @@
   function setProgress(done, total) { pbar.classList.toggle("hidden", total <= 1); pbar.firstChild.style.width = total ? Math.round(done / total * 100) + "%" : "0"; }
   var processed = [], docs = [], MAXW = 1100, S = 5, tessWorker = null;   // docs = de-identified page images for the combined PDF
   var SHOW_CAL_DETAILS = false;   // set true to re-enable the per-result "calibration details" log box
+  var repaints = [];   // per-card canvas repaint fns, re-run when the "show decoded labels" toggle changes
 
   function mode() { return document.querySelector('input[name=mode]:checked').value; }
+
+  // Debug overlay: sampled labels along each decoded trace showing the decoded TIME (m:ss) and VALUE,
+  // so the extracted numbers can be eyeballed against the printed strip. Sampled (~1 per 100 px) to
+  // stay legible; drawn with a white halo so they read over the trace.
+  function drawDecodedLabels(dctx, res, s) {
+    var t = res.calibration.time;
+    function tOf(col) { return (t.start_min + (t.end_min - t.start_min) * (col - t.x_left) / (t.x_right - t.x_left)) * 60; }
+    function fmtT(sec) { sec = Math.round(sec); return Math.floor(sec / 60) + ":" + ("0" + (sec % 60)).slice(-2); }
+    dctx.font = "10px -apple-system,Segoe UI,Roboto,Arial,sans-serif"; dctx.textBaseline = "alphabetic";
+    for (var k = 0; k < res.present.length; k++) {
+      var ov = res.overlay[res.present[k]], lastX = -1e9;
+      for (var j = 0; j < ov.cols.length; j++) {
+        var xp = ov.cols[j] * s; if (xp - lastX < 100) continue; lastX = xp;
+        var txt = fmtT(tOf(ov.cols[j])) + " · " + ov.conv(ov.rows[j]).toFixed(0);
+        var yp = (ov.rows[j] - 5) * s - 5;
+        dctx.lineWidth = 3; dctx.strokeStyle = "rgba(255,255,255,0.95)"; dctx.strokeText(txt, xp + 2, yp);
+        dctx.fillStyle = "#0a2540"; dctx.fillText(txt, xp + 2, yp);
+      }
+    }
+  }
 
   // Known-duration constraint: many monitors export a FIXED page length (e.g. 8 min), which is
   // a far more reliable span than counting gridlines. Returns minutes, or null for auto-detect.
@@ -168,7 +192,8 @@
   drop.addEventListener("dragleave", function () { drop.classList.remove("hover"); });
   drop.addEventListener("drop", function (e) { e.preventDefault(); drop.classList.remove("hover"); filesFromDrop(e.dataTransfer).then(function (files) { if (files.length) handleFiles(files); }); });
   fileInput.addEventListener("change", function () { if (fileInput.files.length) handleFiles(fileInput.files); });
-  $("clear").addEventListener("click", function () { processed = []; docs = []; results.innerHTML = ""; setBarsHidden(true); pbar.classList.add("hidden"); fileInput.value = ""; dlEnabled(false); });
+  $("clear").addEventListener("click", function () { processed = []; docs = []; repaints.length = 0; results.innerHTML = ""; setBarsHidden(true); pbar.classList.add("hidden"); fileInput.value = ""; dlEnabled(false); });
+  $("showlabels").addEventListener("change", function () { for (var i = 0; i < repaints.length; i++) repaints[i](); });
 
   function readFile(file, asBuffer) {
     return new Promise(function (res, rej) { var r = new FileReader(); r.onload = function () { res(r.result); }; r.onerror = function () { rej(new Error("could not read " + file.name)); }; if (asBuffer) r.readAsArrayBuffer(file); else r.readAsDataURL(file); });
@@ -350,29 +375,35 @@
 
     var w = unit.canvas.width, h = unit.canvas.height, s = Math.min(1, MAXW / w);
     var disp = document.createElement("canvas"); disp.width = Math.round(w * s); disp.height = Math.round(h * s);
-    var dctx = disp.getContext("2d"); dctx.drawImage(unit.canvas, 0, 0, disp.width, disp.height);
-    // Highlight where the START timestamp was read: yellow band = the x-axis clock-label row,
-    // magenta line = the first gridline (= strip start / time 0). Lets the user eyeball whether
-    // the auto-decoded start below is right before trusting/overriding it.
-    if (cal && cal._band) {
-      dctx.save();
-      dctx.fillStyle = "rgba(255,205,0,0.30)"; dctx.fillRect(0, cal._band[0] * s, disp.width, (cal._band[1] - cal._band[0]) * s);
-      var xl = (cal._xLeft || 0) * s; dctx.strokeStyle = "#c000c0"; dctx.lineWidth = 2; dctx.beginPath(); dctx.moveTo(xl, 0); dctx.lineTo(xl, disp.height); dctx.stroke();
-      dctx.restore();
-    }
-    // marker drawn slightly above the line (visual only; CSV uses the true row). Interpolated points
-    // (short gaps bridged where no pixel was detectable) are drawn in amber so they read as estimated,
-    // vs measured points in red.
     var interpSeen = false;
-    for (var k = 0; k < res.present.length; k++) {
-      var ov = res.overlay[res.present[k]];
-      for (var j = 0; j < ov.cols.length; j++) {
-        var isI = ov.interp && ov.interp[j];
-        if (isI) interpSeen = true;
-        dctx.fillStyle = isI ? "#ff8c00" : "#e8000b";
-        dctx.fillRect(ov.cols[j] * s, (ov.rows[j] - 5) * s, Math.max(1, s), Math.max(1.3, 1.6 * s));
+    for (var kk = 0; kk < res.present.length; kk++) { var ovk = res.overlay[res.present[kk]]; if (ovk.interp) { for (var jj = 0; jj < ovk.interp.length; jj++) if (ovk.interp[jj]) { interpSeen = true; break; } } if (interpSeen) break; }
+    // Repaintable: base image + start-timestamp highlight + trace markers (+ optional decoded labels).
+    // Registered in `repaints` so toggling "show decoded labels" re-renders every card live.
+    function paintDisp() {
+      var dctx = disp.getContext("2d");
+      dctx.clearRect(0, 0, disp.width, disp.height);
+      dctx.drawImage(unit.canvas, 0, 0, disp.width, disp.height);
+      // Highlight where the START timestamp was read: yellow band = x-axis clock-label row,
+      // magenta line = first gridline (= strip start / time 0).
+      if (cal && cal._band) {
+        dctx.save();
+        dctx.fillStyle = "rgba(255,205,0,0.30)"; dctx.fillRect(0, cal._band[0] * s, disp.width, (cal._band[1] - cal._band[0]) * s);
+        var xl = (cal._xLeft || 0) * s; dctx.strokeStyle = "#c000c0"; dctx.lineWidth = 2; dctx.beginPath(); dctx.moveTo(xl, 0); dctx.lineTo(xl, disp.height); dctx.stroke();
+        dctx.restore();
       }
+      // markers slightly above the line (visual only; CSV uses the true row). Interpolated points
+      // (short gaps bridged where no pixel was detectable) are amber = estimated; measured = red.
+      for (var k = 0; k < res.present.length; k++) {
+        var ov = res.overlay[res.present[k]];
+        for (var j = 0; j < ov.cols.length; j++) {
+          dctx.fillStyle = (ov.interp && ov.interp[j]) ? "#ff8c00" : "#e8000b";
+          dctx.fillRect(ov.cols[j] * s, (ov.rows[j] - 5) * s, Math.max(1, s), Math.max(1.3, 1.6 * s));
+        }
+      }
+      if ($("showlabels").checked) drawDecodedLabels(dctx, res, s);
     }
+    paintDisp();
+    repaints.push(paintDisp);
     if (interpSeen) badges.appendChild(badge("🔶 amber = interpolated (gaps < 10 s)", "warn"));
     card.appendChild(disp);
 

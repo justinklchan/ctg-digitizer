@@ -570,6 +570,24 @@
     const tocoInk = inkMaskBand(d, W, H, ink, tocoLo, tocoHi);
     const tocoTrace = traceFollow(tocoInk, W, H, scan_left, scan_right, Math.max(12, Math.round(0.10 * (tocoHi - tocoLo))));
 
+    // Robust TOCO zero-line for the STANDARD scale. Some strips carry full-width lines BELOW the
+    // data panel (a footer/annotation-box border) that get detected as gridlines; taking the
+    // bottom-most as 0 with a fixed 20-unit step then anchors the scale too low and roughly DOUBLES
+    // every value (e.g. a ~30 baseline read as ~64). The trace never enters those lines, so if the
+    // current 0-line sits MORE THAN a gridline-cell below the trace's lowest point, treat the lines
+    // below the trace as spurious and re-anchor 0 to the first gridline at/below that point (and 20
+    // to the gridline above it). Guarded so clean strips -- where the baseline sits just above the
+    // true 0-line -- are left untouched (no regression on tick/standard variants).
+    if (!o.toco_cal && tocoTrace.rows.length >= 8) {
+      let maxRow = 0; for (let j = 0; j < tocoTrace.rows.length; j++) if (tocoTrace.rows[j] > maxRow) maxRow = tocoTrace.rows[j];
+      const sp = []; for (let i = 1; i < tocoRows.length; i++) sp.push(tocoRows[i] - tocoRows[i - 1]);
+      const msp = median(sp);
+      if (msp > 0 && tocoRows[tocoRows.length - 1] - maxRow > 1.3 * msp) {   // 0-line far below the trace => sub-panel lines present
+        let zi = -1; for (let i = 0; i < tocoRows.length; i++) if (tocoRows[i] >= maxRow - 2) { zi = i; break; }
+        if (zi > 0) { trB = tocoRows[zi]; tvB = o.toco_bot; trT = tocoRows[zi - 1]; tvT = o.toco_bot + o.toco_step; log.push("TOCO scale (panel-anchored, dropped " + (tocoRows.length - 1 - zi) + " sub-panel gridline(s)): row " + Math.round(trB) + "->" + tvB + ", row " + Math.round(trT) + "->" + tvT); }
+      }
+    }
+
     const overlay = {}, present = [];
     // Hampel-style despike: drop samples that sit far outside the LOCAL baseline (rolling
     // median +/- a robust spread). Annotation marks (axis text, arrows, event markers) caught
