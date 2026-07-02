@@ -360,8 +360,20 @@
       var xl = (cal._xLeft || 0) * s; dctx.strokeStyle = "#c000c0"; dctx.lineWidth = 2; dctx.beginPath(); dctx.moveTo(xl, 0); dctx.lineTo(xl, disp.height); dctx.stroke();
       dctx.restore();
     }
-    dctx.fillStyle = "#e8000b";
-    for (var k = 0; k < res.present.length; k++) { var ov = res.overlay[res.present[k]]; for (var j = 0; j < ov.cols.length; j++) dctx.fillRect(ov.cols[j] * s, (ov.rows[j] - 5) * s, Math.max(1, s), Math.max(1.3, 1.6 * s)); }  // marker drawn slightly above the line (visual only; CSV uses the true row)
+    // marker drawn slightly above the line (visual only; CSV uses the true row). Interpolated points
+    // (short gaps bridged where no pixel was detectable) are drawn in amber so they read as estimated,
+    // vs measured points in red.
+    var interpSeen = false;
+    for (var k = 0; k < res.present.length; k++) {
+      var ov = res.overlay[res.present[k]];
+      for (var j = 0; j < ov.cols.length; j++) {
+        var isI = ov.interp && ov.interp[j];
+        if (isI) interpSeen = true;
+        dctx.fillStyle = isI ? "#ff8c00" : "#e8000b";
+        dctx.fillRect(ov.cols[j] * s, (ov.rows[j] - 5) * s, Math.max(1, s), Math.max(1.3, 1.6 * s));
+      }
+    }
+    if (interpSeen) badges.appendChild(badge("🔶 amber = interpolated (gaps < 10 s)", "warn"));
     card.appendChild(disp);
 
     var name = uniqueName(unit.csvStem);

@@ -425,7 +425,7 @@
       crop_right: opts.crop_right == null ? null : Number(opts.crop_right),
       grid_s: opts.grid_s == null || opts.grid_s === "" ? null : Number(opts.grid_s),
       max_gap_px: num(opts.max_gap_px, 4), start_clock: opts.start_clock || null,
-      max_bridge_px: num(opts.max_bridge_px, 16),  // recover/bridge interior gaps up to this width; longer gaps stay NaN
+      max_bridge_s: num(opts.max_bridge_s, 10),    // recover/bridge interior gaps up to this many SECONDS; longer gaps stay NaN
       fhr_cal: opts.fhr_cal || null,    // [rT,vT,rB,vB]
       toco_cal: opts.toco_cal || null,
     };
@@ -602,7 +602,8 @@
     }
     function addSeries(name, tr, conv, hue, floor, band) {
       const ft = floor ? despike(tr.cols, tr.rows, conv, floor) : tr;
-      overlay[name] = { cols: ft.cols, rows: ft.rows, conv: conv, hue: hue || 0, band: band };
+      const interp = new Array(ft.cols.length); for (let j = 0; j < interp.length; j++) interp[j] = false;   // measured (not interpolated)
+      overlay[name] = { cols: ft.cols, rows: ft.rows, conv: conv, hue: hue || 0, band: band, interp: interp };
       present.push(name);
       let vmin = Infinity, vmax = -Infinity;
       for (let j = 0; j < ft.rows.length; j++) { const v = conv(ft.rows[j]); if (v < vmin) vmin = v; if (v > vmax) vmax = v; }
@@ -614,18 +615,22 @@
     if (tocoTrace.cols.length) addSeries("toco", tocoTrace, to_toco, meanHue(d, tocoInk), 18, tocoBand);
     if (!present.length) throw new Error("no colored traces detected. Try a lower color sensitivity.");
 
+    const sec_per_px = (end_min - o.start_min) * 60.0 / (x_right - x_left);
+
     // --- gap recovery + short-gap bridge (per series) ---
     // A printed trace can momentarily fade to near-white (a thin, anti-aliased colored line on a
     // high-resolution scan) or be occluded where it crosses a gridline, leaving columns with no
     // detectable ink -- a DASHED extraction of an obviously-continuous trace. For each SHORT interior
-    // gap (<= o.max_bridge_px columns) we first try to recover a REAL pixel: search a few rows around
-    // the row linearly interpolated from the gap's two endpoints for the best trace-matching pixel --
-    // for a colored trace, a pixel whose hue matches the trace's own colour (rejecting gridlines and
-    // the other trace); for a dark trace, the darkest achromatic pixel -- at a relaxed threshold. This
-    // is safe precisely because it only looks in a tiny window at the expected location, so noise
-    // elsewhere is never admitted. If no real pixel is there (faded to white) the column is bridged by
-    // interpolation. Gaps WIDER than o.max_bridge_px are left as NaN: a long dropout may be genuine
-    // signal loss or hide a real excursion, which must not be invented.
+    // gap (spanning less than o.max_bridge_s seconds) we first try to recover a REAL pixel: search a
+    // few rows around the row linearly interpolated from the gap's two endpoints for the best
+    // trace-matching pixel -- for a colored trace, a pixel whose hue matches the trace's own colour
+    // (rejecting gridlines and the other trace); for a dark trace, the darkest achromatic pixel -- at
+    // a relaxed threshold. This is safe precisely because it only looks in a tiny window at the
+    // expected location, so noise elsewhere is never admitted. If no real pixel is there (faded to
+    // white) the column is bridged by INTERPOLATION and flagged in `ov.interp` (rendered in a distinct
+    // colour). Gaps LONGER than o.max_bridge_s are left as NaN: a long dropout may be genuine signal
+    // loss or hide a real excursion, which must not be invented.
+    const maxGapPx = Math.max(1, Math.floor(o.max_bridge_s / (sec_per_px > 0 ? sec_per_px : 1)));   // 10 s -> px via the time scale
     const hueTrace = !colored;   // gray-grid/colored and dark-bg/colored schemes: hue is meaningful
     function traceScore(x, y, hue0) {
       const off = (y * W + x) * 4, r = d[off], g = d[off + 1], b = d[off + 2];
@@ -642,27 +647,26 @@
     function fillTrace(ov) {
       const det = ov.cols.map(function (c, i) { return [c, ov.rows[i]]; }).sort(function (a, b) { return a[0] - b[0]; });
       if (det.length < 2) return;
-      const add = [];
+      const add = [];   // [col, row, isInterpolated]
       for (let di = 1; di < det.length; di++) {
         const lo = det[di - 1][0], hi = det[di][0], gap = hi - lo - 1;
-        if (gap <= 0 || gap > o.max_bridge_px) continue;
+        if (gap <= 0 || gap > maxGapPx) continue;
         const rL = det[di - 1][1], rR = det[di][1];
         for (let x = lo + 1; x < hi; x++) {
           const erow = rL + (rR - rL) * (x - lo) / (hi - lo), e = Math.round(erow);
           let bestY = -1, bestS = -1;
           for (let y = Math.max(0, e - 5), ye = Math.min(H - 1, e + 5); y <= ye; y++) { const sc = traceScore(x, y, ov.hue); if (sc > bestS) { bestS = sc; bestY = y; } }
-          add.push([x, bestS >= 0 ? bestY : erow]);        // real pixel where found, else interpolated row
+          add.push([x, bestS >= 0 ? bestY : erow, bestS < 0]);   // recovered REAL pixel, else INTERPOLATED (flagged)
         }
       }
       if (!add.length) return;
-      for (let k = 0; k < add.length; k++) { ov.cols.push(add[k][0]); ov.rows.push(add[k][1]); }
+      for (let k = 0; k < add.length; k++) { ov.cols.push(add[k][0]); ov.rows.push(add[k][1]); ov.interp.push(add[k][2]); }
       const idx = ov.cols.map(function (_, i) { return i; }).sort(function (a, b) { return ov.cols[a] - ov.cols[b]; });
       ov.cols = idx.map(function (i) { return ov.cols[i]; });
       ov.rows = idx.map(function (i) { return ov.rows[i]; });
+      ov.interp = idx.map(function (i) { return ov.interp[i]; });
     }
     for (let pi = 0; pi < present.length; pi++) if (overlay[present[pi]].band) fillTrace(overlay[present[pi]]);
-
-    const sec_per_px = (end_min - o.start_min) * 60.0 / (x_right - x_left);
 
     // --- output columns ---
     let timeGrid, colsOut;
