@@ -4,11 +4,17 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>CTG Digitizer</title>
+<link rel="icon" type="image/x-icon" href="favicon.ico">
+<link rel="icon" type="image/png" sizes="32x32" href="favicon-32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="favicon-16.png">
+<link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png">
 <style>
   :root { --fg:#1c2330; --muted:#5b6472; --line:#d7dce3; --accent:#2c5ac8; --bg:#f6f7f9; --ok:#16653a; --warn:#9a6700; --bad:#b00020; }
   * { box-sizing:border-box; }
   body { font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; color:var(--fg); margin:0; background:var(--bg); line-height:1.45; }
   header { background:#fff; border-bottom:1px solid var(--line); padding:16px 24px; }
+  .brand { display:flex; align-items:center; gap:14px; }
+  .logo { flex:0 0 auto; border-radius:10px; display:block; }
   h1 { font-size:19px; margin:0 0 4px; }
   .sub { color:var(--muted); font-size:13px; }
   .privacy { color:var(--ok); background:#e7f6ec; border:1px solid #bfe3cc; border-radius:6px; padding:6px 10px; font-size:12.5px; display:inline-block; margin-top:8px; }
@@ -49,8 +55,13 @@
 </head>
 <body>
 <header>
-  <h1>CTG Digitizer</h1>
-  <div class="sub">Drop cardiotocography strips (PDF or image) &mdash; each is digitized automatically into a CSV time series. Traces are separated by panel; the axis scale is read off the strip.</div>
+  <div class="brand">
+    <img src="logo.png" alt="CTG Digitizer logo" class="logo" width="56" height="56">
+    <div>
+      <h1>CTG Digitizer</h1>
+      <div class="sub">Drop cardiotocography strips (PDF or image) &mdash; each is digitized automatically into a CSV time series. Traces are separated by panel; the axis scale is read off the strip.</div>
+    </div>
+  </div>
   <div class="privacy">&#128274; Runs entirely in your browser. Your strips are never uploaded &mdash; only this page's code is downloaded, the images stay on your computer.</div>
 </header>
 <main>
