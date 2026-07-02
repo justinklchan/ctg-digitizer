@@ -217,6 +217,44 @@
     return { cols: cols, rows: rows };
   }
 
+  // Centres of every vertical ink RUN in a column (runs split where consecutive ink rows are
+  // more than 2 px apart) -- the candidate trace positions at that column.
+  function runCentersAt(mask, W, H, c) {
+    const ys = []; for (let y = 0; y < H; y++) if (mask[y * W + c]) ys.push(y);
+    if (!ys.length) return [];
+    const centers = []; let s = 0;
+    for (let k = 1; k <= ys.length; k++) {
+      if (k === ys.length || ys[k] - ys[k - 1] > 2) { let sum = 0; for (let j = s; j < k; j++) sum += ys[j]; centers.push(sum / (k - s)); s = k; }
+    }
+    return centers;
+  }
+
+  // Follow a SINGLE trace across columns by CONTINUITY. At each column, among the vertical ink
+  // runs, choose the one whose centre is nearest the running trajectory (the last accepted centre)
+  // rather than the LONGEST run. `dominantRunCenter` (longest run) is hijacked wherever a thicker
+  // spurious run -- an event marker, a printed feature, the trace's own shadow -- shares the column
+  // with a thin flat trace, which mislocates the point (then the despike deletes it, leaving the
+  // flat stretch un-digitized). Anchored at a stable single-run column nearest the median baseline
+  // and grown outward both ways; a column whose nearest run is farther than maxJump is left empty
+  // (NaN -> recovered/bridged downstream). Falls back to the plain dominant-run trace when there is
+  // no clean single-run anchor.
+  function traceFollow(mask, W, H, colLo, colHi, maxJump) {
+    const n = colHi - colLo; if (n <= 0) return { cols: [], rows: [] };
+    const cc = new Array(n), single = [];
+    for (let i = 0; i < n; i++) { const cs = runCentersAt(mask, W, H, colLo + i); cc[i] = cs; if (cs.length === 1) single.push(cs[0]); }
+    if (single.length < 0.15 * n) return traceFromMask(mask, W, H, colLo, colHi);   // too few clean columns to anchor
+    const seed = median(single);
+    let aIdx = -1, aBest = Infinity, aCen = seed;
+    for (let i = 0; i < n; i++) if (cc[i].length === 1) { const dd = Math.abs(cc[i][0] - seed); if (dd < aBest) { aBest = dd; aIdx = i; aCen = cc[i][0]; } }
+    const row = new Float64Array(n); row.fill(NaN); row[aIdx] = aCen;
+    const step = function (prev, cs) { let best = NaN, bd = Infinity; for (let j = 0; j < cs.length; j++) { const dd = Math.abs(cs[j] - prev); if (dd < bd) { bd = dd; best = cs[j]; } } return bd <= maxJump ? best : NaN; };
+    let p = aCen; for (let i = aIdx + 1; i < n; i++) { const r = cc[i].length ? step(p, cc[i]) : NaN; if (!isNaN(r)) { row[i] = r; p = r; } }
+    p = aCen; for (let i = aIdx - 1; i >= 0; i--) { const r = cc[i].length ? step(p, cc[i]) : NaN; if (!isNaN(r)) { row[i] = r; p = r; } }
+    const cols = [], rows = [];
+    for (let i = 0; i < n; i++) if (!isNaN(row[i])) { cols.push(colLo + i); rows.push(row[i]); }
+    return { cols: cols, rows: rows };
+  }
+
   // --- per-row "ink" (saturated = colored trace) count over [lo,hi], lightly smoothed ---
   function rowInkProfile(d, W, H, ink, lo, hi) {
     const prof = new Float64Array(H);
@@ -524,9 +562,13 @@
     if (!fhrOut.length && cand.length) { cand.sort(function (a, b) { return b.cov - a.cov; }); fhrOut = [cand[0]]; }
     fhrOut.sort(function (a, b) { return b.mean - a.mean; });   // higher bpm first = fetal
 
-    // TOCO panel is its own subplot: a single trace, lower ink band
-    const tocoInk = inkMaskBand(d, W, H, ink, boundary, tocoRows[tocoRows.length - 1] + 4);
-    const tocoTrace = traceFromMask(tocoInk, W, H, scan_left, scan_right);
+    // TOCO panel is its own subplot: a single trace, lower ink band. Follow it by continuity so a
+    // thin flat baseline is not hijacked by a thicker spurious run in the same column (the cause of
+    // un-digitized flat TOCO stretches); maxJump scales with the panel height so real contractions
+    // (which move gradually per column) are tracked while a far-off spurious run is rejected.
+    const tocoLo = boundary, tocoHi = tocoRows[tocoRows.length - 1] + 4;
+    const tocoInk = inkMaskBand(d, W, H, ink, tocoLo, tocoHi);
+    const tocoTrace = traceFollow(tocoInk, W, H, scan_left, scan_right, Math.max(12, Math.round(0.10 * (tocoHi - tocoLo))));
 
     const overlay = {}, present = [];
     // Hampel-style despike: drop samples that sit far outside the LOCAL baseline (rolling
