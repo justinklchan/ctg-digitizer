@@ -82,7 +82,7 @@
     <label><input type="radio" name="dur" value="fixed"> Fixed <input id="durmin" type="number" value="8" min="0.5" step="0.5" style="width:56px;font:inherit;padding:2px 5px;border:1px solid var(--line);border-radius:5px;"> min (known constraint)</label>
   </div>
   <div class="opts">
-    <label><input type="checkbox" id="showlabels"> Show decoded value labels on the trace (debug: time &amp; value)</label>
+    <label><input type="checkbox" id="showlabels" checked> Label the trace once per minute with the decoded timestamp &amp; value</label>
   </div>
 
   <div class="bar hidden" id="bar">
@@ -128,20 +128,27 @@
 
   function mode() { return document.querySelector('input[name=mode]:checked').value; }
 
-  // Debug overlay: sampled labels along each decoded trace showing the decoded TIME (m:ss) and VALUE,
-  // so the extracted numbers can be eyeballed against the printed strip. Sampled (~1 per 100 px) to
-  // stay legible; drawn with a white halo so they read over the trace.
-  function drawDecodedLabels(dctx, res, s) {
+  var timeOfCol;   // col -> seconds from strip start; set per-render from the time calibration
+  function setTimeMap(res) {
     var t = res.calibration.time;
-    function tOf(col) { return (t.start_min + (t.end_min - t.start_min) * (col - t.x_left) / (t.x_right - t.x_left)) * 60; }
-    function fmtT(sec) { sec = Math.round(sec); return Math.floor(sec / 60) + ":" + ("0" + (sec % 60)).slice(-2); }
+    timeOfCol = function (col) { return (t.start_min + (t.end_min - t.start_min) * (col - t.x_left) / (t.x_right - t.x_left)) * 60; };
+  }
+
+  // Annotate each decoded trace ONCE PER MINUTE (starting at its beginning point) with the decoded
+  // ABSOLUTE timestamp (HH:MM:SS from the strip's start time) and value -- or the relative m:ss when
+  // no start time is known. One uniform small style (white halo, dark text); startSec comes from the
+  // editable start-time field, so the canvas repaints when it changes.
+  function drawLabels(dctx, res, s, startSec) {
+    setTimeMap(res);
     dctx.font = "10px -apple-system,Segoe UI,Roboto,Arial,sans-serif"; dctx.textBaseline = "alphabetic";
     for (var k = 0; k < res.present.length; k++) {
-      var ov = res.overlay[res.present[k]], lastX = -1e9;
+      var ov = res.overlay[res.present[k]]; if (!ov.cols.length) continue;
+      var nextMark = timeOfCol(ov.cols[0]);   // first point (beginning), then every 60 s
       for (var j = 0; j < ov.cols.length; j++) {
-        var xp = ov.cols[j] * s; if (xp - lastX < 100) continue; lastX = xp;
-        var txt = fmtT(tOf(ov.cols[j])) + " · " + ov.conv(ov.rows[j]).toFixed(0);
-        var yp = (ov.rows[j] - 5) * s - 5;
+        var relSec = timeOfCol(ov.cols[j]); if (relSec < nextMark) continue;
+        nextMark = relSec + 60;
+        var txt = (startSec != null ? secToHM(startSec + relSec) : (Math.round(relSec / 60) + "m")) + " · " + ov.conv(ov.rows[j]).toFixed(0);   // HH:MM (no seconds)
+        var xp = ov.cols[j] * s, yp = (ov.rows[j] - 5) * s - 5;
         dctx.lineWidth = 3; dctx.strokeStyle = "rgba(255,255,255,0.95)"; dctx.strokeText(txt, xp + 2, yp);
         dctx.fillStyle = "#0a2540"; dctx.fillText(txt, xp + 2, yp);
       }
@@ -388,8 +395,10 @@
     var disp = document.createElement("canvas"); disp.width = Math.round(w * s); disp.height = Math.round(h * s);
     var interpSeen = false;
     for (var kk = 0; kk < res.present.length; kk++) { var ovk = res.overlay[res.present[kk]]; if (ovk.interp) { for (var jj = 0; jj < ovk.interp.length; jj++) if (ovk.interp[jj]) { interpSeen = true; break; } } if (interpSeen) break; }
-    // Repaintable: base image + start-timestamp highlight + trace markers (+ optional decoded labels).
-    // Registered in `repaints` so toggling "show decoded labels" re-renders every card live.
+    var startSec0 = roundToMin(cal && cal.start_clock ? parseClockToSec(cal.start_clock) : null);   // start is minute-granularity (PDF has no seconds)
+    var curStart = startSec0;   // effective start-of-strip seconds (updated live by the start-time field), drives absolute label times
+    // Repaintable: base image + start-timestamp highlight + trace markers + per-minute time/value labels.
+    // Registered in `repaints` so toggling the labels checkbox / editing the start time re-renders live.
     function paintDisp() {
       var dctx = disp.getContext("2d");
       dctx.clearRect(0, 0, disp.width, disp.height);
@@ -411,7 +420,7 @@
           dctx.fillRect(ov.cols[j] * s, (ov.rows[j] - 5) * s, Math.max(1, s), Math.max(1.3, 1.6 * s));
         }
       }
-      if ($("showlabels").checked) drawDecodedLabels(dctx, res, s);
+      if ($("showlabels").checked) drawLabels(dctx, res, s, curStart);
     }
     paintDisp();
     repaints.push(paintDisp);
@@ -419,7 +428,6 @@
     card.appendChild(disp);
 
     var name = uniqueName(unit.csvStem);
-    var startSec0 = roundToMin(cal && cal.start_clock ? parseClockToSec(cal.start_clock) : null);   // start is minute-granularity (PDF has no seconds)
     var entry = { csvName: name, csv: res.csv, startSec: startSec0 };   // startSec drives the CSV's absolute clock column
     processed.push(entry);
 
@@ -439,6 +447,7 @@
         else { entry.startSec = sec; inp.style.borderColor = "var(--ok)"; setNote(sec === startSec0 ? "confirmed" : "overridden ✎ — applied on download / preview", "var(--ok)"); }
       }
       if (!prev.classList.contains("hidden")) refreshPreview();   // keep an open CSV preview in sync
+      curStart = entry.startSec; paintDisp();                      // update absolute timestamps on the trace labels
     });
     tsRow.appendChild(lab); tsRow.appendChild(inp); tsRow.appendChild(note); card.appendChild(tsRow);
 
