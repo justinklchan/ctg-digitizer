@@ -4,9 +4,9 @@
  * colored traces (the common case) or a colored gridline lattice with dark/achromatic
  * traces -- and traces are separated by PANEL (top = FHR, bottom = TOCO) and by VERTICAL
  * POSITION within a panel (the widest interior ink-free valley), never by hue. The two
- * FHR-panel traces are labelled by mean value (higher = us_fhr_bpm, the primary FHR;
- * lower = fhr2_bpm = maternal), matching the usual FHR-above-maternal layout; the maternal
- * trace is emitted only when actually present.
+ * FHR-panel traces are labelled by mean value (higher = fhr, the primary fetal heart rate;
+ * lower = mhr = maternal heart rate), matching the usual FHR-above-maternal layout; the
+ * maternal trace is emitted only when actually present.
  *
  * Calibration is either taken from explicit overrides (opts.fhr_cal /
  * opts.toco_cal / opts.start_min / opts.end_min, e.g. from OCR of the printed
@@ -610,8 +610,8 @@
       log.push(pad(name, 11) + ": " + ft.cols.length + " pts, range " + vmin.toFixed(1) + ".." + vmax.toFixed(1) + " (hue " + Math.round(hue || 0) + ")");
     }
     const fhrBand = [ftLo, ftHi], tocoBand = [Math.max(0, Math.floor(boundary)), Math.min(H - 1, tocoRows[tocoRows.length - 1] + 4)];
-    if (fhrOut[0]) addSeries("us_fhr_bpm", fhrOut[0].tr, to_fhr, fhrOut[0].hue, 12, fhrBand);
-    if (fhrOut[1]) addSeries("fhr2_bpm", fhrOut[1].tr, to_fhr, fhrOut[1].hue, 12, fhrBand);
+    if (fhrOut[0]) addSeries("fhr", fhrOut[0].tr, to_fhr, fhrOut[0].hue, 12, fhrBand);
+    if (fhrOut[1]) addSeries("mhr", fhrOut[1].tr, to_fhr, fhrOut[1].hue, 12, fhrBand);
     if (tocoTrace.cols.length) addSeries("toco", tocoTrace, to_toco, meanHue(d, tocoInk), 18, tocoBand);
     if (!present.length) throw new Error("no colored traces detected. Try a lower color sensitivity.");
 

@@ -85,7 +85,7 @@
     <span class="muted" id="progressBottom"></span>
   </div>
 
-  <div class="muted" style="margin-top:18px;">Auto-detect reads the printed axis numbers (OCR) and falls back to the standard scale per-axis when a strip's labels can't be read reliably &mdash; the badges on each result say which was used. The red dots show the extracted trace; check they sit on the lines.</div>
+  <div class="muted" style="margin-top:18px;">Auto-detect reads the printed axis numbers (OCR) and falls back to the standard scale per-axis when a strip's labels can't be read reliably &mdash; the badges on each result say which was used. <b>Red dots</b> are measured points from the trace; <b style="color:#c46a00;">amber dots are interpolated</b> across short gaps &mdash; where the trace briefly fades or is occluded, gaps shorter than <b>10&nbsp;s</b> are filled by interpolation (longer gaps are left blank/NaN). Check the dots sit on the lines.</div>
 </main>
 
 <script src="vendor/pdf.min.js"></script>
