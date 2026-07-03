@@ -56,7 +56,10 @@
   function circDist(a, b) { const d = Math.abs(a - b); return Math.min(d, 360 - d); }
 
   // --- gridlines: low-saturation, not-white rows/cols covering >50% ---
-  function detectGridlines(d, W, H) {
+  // maxBright (default 210) is the gray-line brightness cutoff; digitize retries with a
+  // higher cutoff when a faintly printed lattice defeats the default.
+  function detectGridlines(d, W, H, maxBright) {
+    if (maxBright == null) maxBright = 210;
     const rowCount = new Int32Array(H), colCount = new Int32Array(W);
     for (let y = 0; y < H; y++) {
       let off = y * W * 4;
@@ -64,7 +67,7 @@
         const r = d[off], g = d[off + 1], b = d[off + 2];
         const mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
         const mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
-        if (mx - mn < 25 && mx < 210) { rowCount[y]++; colCount[x]++; }
+        if (mx - mn < 25 && mx < maxBright) { rowCount[y]++; colCount[x]++; }
       }
     }
     const rowIdx = [], colIdx = [];
@@ -116,6 +119,16 @@
     for (let y = 0; y < H; y++) if (rowCount[y] / W > 0.4) rowIdx.push(y);
     for (let x = 0; x < W; x++) if (colCount[x] / H > 0.4) colIdx.push(x);
     return { rows: groupLines(rowIdx, 3), cols: groupLines(colIdx, 3) };
+  }
+
+  // is every gap between consecutive lines within 35% of the median gap? (a uniform
+  // minor lattice, as opposed to a majors-plus-extras mix)
+  function uniformSpacing(rows) {
+    if (rows.length < 3) return false;
+    const sp = []; for (let i = 1; i < rows.length; i++) sp.push(rows[i] - rows[i - 1]);
+    const m = median(sp); if (m <= 0) return false;
+    for (let i = 0; i < sp.length; i++) if (Math.abs(sp[i] - m) > 0.35 * m) return false;
+    return true;
   }
 
   // split horizontal gridlines into FHR (top) and TOCO (bottom) at the biggest gap
@@ -196,6 +209,40 @@
     return cut > 2 && cut < top ? cut : -1;
   }
 
+  // --- content bounds: trim large blank page margins around the strip ---
+  // Whole-page PDF exports often place a short strip band in the middle of a mostly
+  // blank page. The full-span coverage tests in gridline detection then fail: a
+  // vertical gridline covers only the band, never >50% of the PAGE. This finds the
+  // bounding box of non-background ink (per-row/col counts, so a stray speck cannot
+  // stretch it) and returns {top, bottom, left, right} (inclusive, padded) when the
+  // margins are big enough to matter, or null when the image is already tight --
+  // ordinary strips and dark monitor screenshots are left untouched.
+  function detectContentBounds(d, W, H) {
+    if (isDarkBackground(d, W, H)) return null;            // dark bg: "margins" are content
+    const rowInk = new Int32Array(H), colInk = new Int32Array(W);
+    for (let y = 0; y < H; y++) {
+      let off = y * W * 4;
+      for (let x = 0; x < W; x++, off += 4) {
+        const r = d[off], g = d[off + 1], b = d[off + 2];
+        const mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
+        if (mx < 245) { rowInk[y]++; colInk[x]++; }        // any non-near-white ink
+      }
+    }
+    const rTh = Math.max(3, Math.round(0.002 * W)), cTh = Math.max(3, Math.round(0.002 * H));
+    let top = 0; while (top < H && rowInk[top] < rTh) top++;
+    let bottom = H - 1; while (bottom > top && rowInk[bottom] < rTh) bottom--;
+    let left = 0; while (left < W && colInk[left] < cTh) left++;
+    let right = W - 1; while (right > left && colInk[right] < cTh) right--;
+    if (top >= bottom || left >= right) return null;       // blank page
+    const padPx = Math.round(0.005 * (W > H ? W : H)) + 4;
+    top = Math.max(0, top - padPx); bottom = Math.min(H - 1, bottom + padPx);
+    left = Math.max(0, left - padPx); right = Math.min(W - 1, right + padPx);
+    // only report a crop that removes a substantial margin; small trims would just
+    // perturb otherwise-working strips
+    if (bottom - top + 1 > 0.92 * H && right - left + 1 > 0.92 * W) return null;
+    return { top: top, bottom: bottom, left: left, right: right };
+  }
+
   function dominantRunCenter(ys) {
     if (ys.length === 1) return ys[0];
     const starts = [0], ends = [];
@@ -236,8 +283,12 @@
   // with a thin flat trace, which mislocates the point (then the despike deletes it, leaving the
   // flat stretch un-digitized). Anchored at a stable single-run column nearest the median baseline
   // and grown outward both ways; a column whose nearest run is farther than maxJump is left empty
-  // (NaN -> recovered/bridged downstream). Falls back to the plain dominant-run trace when there is
-  // no clean single-run anchor.
+  // (NaN -> recovered/bridged downstream). If the follower gets LOST (several consecutive columns
+  // whose runs all exceed maxJump) it RE-ANCHORS onto the current column's nearest run instead of
+  // stalling: a steep spike apex whose down-slope exceeds maxJump would otherwise freeze `prev` up
+  // at the apex and reject the whole following stretch of a real trace 13+ px away (the un-digitized
+  // contraction down-slope). Safe because this drives only the single-trace TOCO panel. Falls back
+  // to the plain dominant-run trace when there is no clean single-run anchor.
   function traceFollow(mask, W, H, colLo, colHi, maxJump) {
     const n = colHi - colLo; if (n <= 0) return { cols: [], rows: [] };
     const cc = new Array(n), single = [];
@@ -247,9 +298,21 @@
     let aIdx = -1, aBest = Infinity, aCen = seed;
     for (let i = 0; i < n; i++) if (cc[i].length === 1) { const dd = Math.abs(cc[i][0] - seed); if (dd < aBest) { aBest = dd; aIdx = i; aCen = cc[i][0]; } }
     const row = new Float64Array(n); row.fill(NaN); row[aIdx] = aCen;
-    const step = function (prev, cs) { let best = NaN, bd = Infinity; for (let j = 0; j < cs.length; j++) { const dd = Math.abs(cs[j] - prev); if (dd < bd) { bd = dd; best = cs[j]; } } return bd <= maxJump ? best : NaN; };
-    let p = aCen; for (let i = aIdx + 1; i < n; i++) { const r = cc[i].length ? step(p, cc[i]) : NaN; if (!isNaN(r)) { row[i] = r; p = r; } }
-    p = aCen; for (let i = aIdx - 1; i >= 0; i--) { const r = cc[i].length ? step(p, cc[i]) : NaN; if (!isNaN(r)) { row[i] = r; p = r; } }
+    const LOST = 3;   // consecutive out-of-range columns (with runs) before re-anchoring
+    const nearest = function (prev, cs) { let best = cs[0], bd = Infinity; for (let j = 0; j < cs.length; j++) { const dd = Math.abs(cs[j] - prev); if (dd < bd) { bd = dd; best = cs[j]; } } return { c: best, d: bd }; };
+    // one directional pass from the anchor; dir = +1 (rightward) or -1 (leftward). A run within
+    // maxJump extends the trace; after LOST consecutive out-of-range columns the follower re-anchors
+    // onto the current column's nearest run so a steep spike apex can't freeze it for the rest of the pass.
+    const walk = function (dir) {
+      let p = aCen, miss = 0;
+      for (let i = aIdx + dir; i >= 0 && i < n; i += dir) {
+        if (!cc[i].length) continue;                       // no ink here: keep prev, bridge downstream
+        const nr = nearest(p, cc[i]);
+        if (nr.d <= maxJump) { row[i] = nr.c; p = nr.c; miss = 0; }
+        else if (++miss >= LOST) { row[i] = nr.c; p = nr.c; miss = 0; }
+      }
+    };
+    walk(1); walk(-1);
     const cols = [], rows = [];
     for (let i = 0; i < n; i++) if (!isNaN(row[i])) { cols.push(colLo + i); rows.push(row[i]); }
     return { cols: cols, rows: rows };
@@ -436,7 +499,7 @@
     // If no gray lattice is found, the gridlines are colored (e.g. brown/pink) and the traces
     // are dark/achromatic (e.g. black) -- detect the colored lattice and flip the ink test.
     const darkBg = isDarkBackground(d, W, H);
-    let grid, colored = false;
+    let grid, colored = false, faintLattice = false;
     if (darkBg) {
       grid = detectGridlinesBright(d, W, H);             // white/gray lattice on dark bg; traces are colored
     } else {
@@ -444,6 +507,19 @@
       if (grid.rows.length < 4 || grid.cols.length < 2) {
         const gc = detectGridlinesColored(d, W, H, Math.max(20, o.sat - 5));
         if (gc.rows.length >= 4 && gc.cols.length >= 2) { grid = gc; colored = true; }
+      }
+      if (grid.rows.length < 4 || grid.cols.length < 2) {
+        // faintly printed gray lattice (light-toner printouts): relax the brightness
+        // cutoff and keep the DENSEST full lattice found -- a partial detection at a
+        // lower cutoff picks up an irregular subset of the lines, which would corrupt
+        // the panel split and calibration downstream
+        let best = null, bestCut = 0;
+        for (const cut of [228, 243]) {
+          const gf = detectGridlines(d, W, H, cut);
+          if (gf.rows.length >= 4 && gf.cols.length >= 2 &&
+              (!best || gf.rows.length + gf.cols.length > best.rows.length + best.cols.length)) { best = gf; bestCut = cut; }
+        }
+        if (best) { grid = best; faintLattice = true; log.push("gridlines : faint lattice (brightness cutoff " + bestCut + ")"); }
       }
     }
     const hrows = grid.rows, vcols = grid.cols;
@@ -466,7 +542,14 @@
       const mx = r > g ? (r > b ? r : b) : (g > b ? g : b), mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
       if (mx - mn >= o.sat) return true;
       const mid = r + g + b - mx - mn;
-      return mx - mid >= 8 && mx < 210;
+      // A muted/pastel COLORED pixel: the dominant channel clears the middle one by a margin
+      // (a real hue tint, so achromatic gray gridlines/text with mx==mid are excluded regardless
+      // of brightness). The brightness ceiling only rejects near-white paper; it must sit well
+      // ABOVE the trace's LIGHTEST anti-aliased body pixels -- a faint desaturated green TOCO/MHR
+      // runs up to ~mx 230, so a 210 ceiling clipped its lighter half and left <2px runs that the
+      // run filter then dropped, biasing the extracted center. 235 keeps near-white out while
+      // capturing the whole line thickness.
+      return mx - mid >= 8 && mx < 235;
     };
     log.push("color scheme: " + (darkBg ? "dark background / colored traces" : colored ? "colored gridlines / dark traces" : "gray gridlines / colored traces"));
 
@@ -476,6 +559,13 @@
     // uses the extreme gridlines, so the exact split index does not affect the scale.
     const fullProf = rowInkProfile(d, W, H, ink, hrows[0], hrows[hrows.length - 1]);
     let boundary = widestInteriorGap(fullProf, hrows[0], hrows[hrows.length - 1]);
+    if (boundary == null) {
+      // strict ink saw at most one band -- a heavily DESATURATED trace (e.g. a muted
+      // green TOCO on a faint print) can be invisible to the saturation test. Retry
+      // with the soft (muted-color) ink before giving up on a position-based split.
+      const softProf = rowInkProfile(d, W, H, inkSoft, hrows[0], hrows[hrows.length - 1]);
+      boundary = widestInteriorGap(softProf, hrows[0], hrows[hrows.length - 1]);
+    }
     if (boundary == null) boundary = splitPanels(hrows).boundary;          // fallback: gridline gap
     let fhrRows = hrows.filter(function (r) { return r <= boundary; });
     let tocoRows = hrows.filter(function (r) { return r > boundary; });
@@ -496,8 +586,16 @@
     let end_min;
     if (o.end_min != null) end_min = o.end_min;
     else {
+      // On a faint lattice every MINOR vertical line was detected, so gaps between
+      // consecutive lines are sub-minute; the 1-minute majors are the DARKER lines the
+      // strict pass still finds -- estimate the minute spacing from those instead.
+      let tcols = vcols;
+      if (faintLattice) {
+        const strictCols = detectGridlines(d, W, H).cols.filter(function (c) { return c >= x_left && c <= x_right; });
+        if (strictCols.length >= 3) { tcols = strictCols; log.push("time grid : " + strictCols.length + " dark major lines"); }
+      }
       const gaps = [];
-      for (let k = 1; k < vcols.length; k++) gaps.push(vcols[k] - vcols[k - 1]);
+      for (let k = 1; k < tcols.length; k++) gaps.push(tcols[k] - tcols[k - 1]);
       const gmax = Math.max.apply(null, gaps);
       const big = gaps.filter(function (g) { return g > 0.6 * gmax; });
       const minute_px = big.length ? median(big) : median(gaps);
@@ -562,13 +660,42 @@
     if (!fhrOut.length && cand.length) { cand.sort(function (a, b) { return b.cov - a.cov; }); fhrOut = [cand[0]]; }
     fhrOut.sort(function (a, b) { return b.mean - a.mean; });   // higher bpm first = fetal
 
+    // Fine-lattice rescue for the STANDARD FHR scale. Some printouts draw EVERY minor
+    // gridline (10 bpm apart) at equal weight, so consecutive detected lines are minors,
+    // not 30-bpm majors, and the standard step reads the trace ~3x too steep (even
+    // negative bpm). Guarded three ways so ordinary strips never change: no explicit
+    // calibration, the lattice must be DENSE and UNIFORM (a majors-only 240..60 grid has
+    // ~7 lines; a full minor lattice has ~19), and the extracted primary trace must be
+    // IMPLAUSIBLE under the standard step. Then one minor line = fhr_step/3 = 10 bpm.
+    if (!o.fhr_cal && fhrOut.length && fhrRows.length >= 12 && uniformSpacing(fhrRows)) {
+      const tr0 = fhrOut[0].tr;
+      let s0 = 0; for (let j = 0; j < tr0.rows.length; j++) s0 += to_fhr(tr0.rows[j]);
+      const mean0 = s0 / tr0.rows.length;
+      if (!(mean0 >= 40 && mean0 <= 230)) {
+        frB = fhrRows[1]; fvB = o.fhr_top - o.fhr_step / 3;
+        log.push("FHR scale : fine minor lattice, " + (o.fhr_step / 3) + " bpm/line: row " + Math.round(frT) + "->" + fvT + ", row " + Math.round(frB) + "->" + fvB);
+      }
+    }
+
     // TOCO panel is its own subplot: a single trace, lower ink band. Follow it by continuity so a
     // thin flat baseline is not hijacked by a thicker spurious run in the same column (the cause of
     // un-digitized flat TOCO stretches); maxJump scales with the panel height so real contractions
     // (which move gradually per column) are tracked while a far-off spurious run is rejected.
     const tocoLo = boundary, tocoHi = tocoRows[tocoRows.length - 1] + 4;
-    const tocoInk = inkMaskBand(d, W, H, ink, tocoLo, tocoHi);
-    const tocoTrace = traceFollow(tocoInk, W, H, scan_left, scan_right, Math.max(12, Math.round(0.10 * (tocoHi - tocoLo))));
+    const tocoJump = Math.max(12, Math.round(0.10 * (tocoHi - tocoLo)));
+    let tocoInk = inkMaskBand(d, W, H, ink, tocoLo, tocoHi);
+    let tocoTrace = traceFollow(tocoInk, W, H, scan_left, scan_right, tocoJump);
+    if (tocoTrace.cols.length < 0.5 * scanW) {
+      // strict ink lost most of the trace -- a heavily desaturated (muted-color) TOCO.
+      // Retry with the soft mask (vertical-run filtered, same as the FHR panel) and
+      // keep whichever recovers more of the span.
+      const softInk = fhrPanelMask(d, W, H, ink, inkSoft, tocoLo, tocoHi);
+      const softTrace = traceFollow(softInk, W, H, scan_left, scan_right, tocoJump);
+      if (softTrace.cols.length > tocoTrace.cols.length) {
+        log.push("TOCO ink  : muted trace, soft-ink mask (" + softTrace.cols.length + " cols vs strict " + tocoTrace.cols.length + ")");
+        tocoTrace = softTrace; tocoInk = softInk;
+      }
+    }
 
     // Robust TOCO zero-line for the STANDARD scale. Some strips carry full-width lines BELOW the
     // data panel (a footer/annotation-box border) that get detected as gridlines; taking the
@@ -585,6 +712,19 @@
       if (msp > 0 && tocoRows[tocoRows.length - 1] - maxRow > 1.3 * msp) {   // 0-line far below the trace => sub-panel lines present
         let zi = -1; for (let i = 0; i < tocoRows.length; i++) if (tocoRows[i] >= maxRow - 2) { zi = i; break; }
         if (zi > 0) { trB = tocoRows[zi]; tvB = o.toco_bot; trT = tocoRows[zi - 1]; tvT = o.toco_bot + o.toco_step; log.push("TOCO scale (panel-anchored, dropped " + (tocoRows.length - 1 - zi) + " sub-panel gridline(s)): row " + Math.round(trB) + "->" + tvB + ", row " + Math.round(trT) + "->" + tvT); }
+      }
+    }
+    // Fine-lattice rescue for the STANDARD TOCO scale (companion to the FHR one above).
+    // On a full minor lattice the 20-units-per-line assumption stretches TOCO far past its
+    // 0..100 range. When the lattice is dense+uniform AND the standard step yields
+    // impossible values, anchor the FULL panel edge-to-edge as 0..100 -- the near-universal
+    // TOCO axis -- instead of guessing a per-line step.
+    if (!o.toco_cal && tocoTrace.rows.length >= 8 && tocoRows.length >= 12 && uniformSpacing(tocoRows)) {
+      let vmin = Infinity, vmax = -Infinity;
+      for (let j = 0; j < tocoTrace.rows.length; j++) { const v = to_toco(tocoTrace.rows[j]); if (v < vmin) vmin = v; if (v > vmax) vmax = v; }
+      if (vmax > 115 || vmin < -10) {
+        trT = tocoRows[0]; tvT = 100; trB = tocoRows[tocoRows.length - 1]; tvB = o.toco_bot;
+        log.push("TOCO scale: fine minor lattice, full panel: row " + Math.round(trT) + "->" + tvT + ", row " + Math.round(trB) + "->" + tvB);
       }
     }
 
@@ -770,6 +910,7 @@
   const api = {
     digitize: digitize,
     detectHeaderCut: detectHeaderCut,
+    detectContentBounds: detectContentBounds,
     _internal: { detectGridlines: detectGridlines, splitPanels: splitPanels, detectNumberBands: detectNumberBands, groupLines: groupLines, median: median, linmap: linmap, hueOf: hueOf },
   };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
