@@ -264,16 +264,17 @@
     return { cols: cols, rows: rows };
   }
 
-  // Centres of every vertical ink RUN in a column (runs split where consecutive ink rows are
-  // more than 2 px apart) -- the candidate trace positions at that column.
-  function runCentersAt(mask, W, H, c) {
+  // Every vertical ink RUN in a column (runs split where consecutive ink rows are more than
+  // 2 px apart) with its centre `c` and extent `top`/`bot` -- the candidate trace positions
+  // at that column. `top` is the topmost (smallest-y = highest-value) ink row of the run.
+  function runsAt(mask, W, H, c) {
     const ys = []; for (let y = 0; y < H; y++) if (mask[y * W + c]) ys.push(y);
     if (!ys.length) return [];
-    const centers = []; let s = 0;
+    const runs = []; let s = 0;
     for (let k = 1; k <= ys.length; k++) {
-      if (k === ys.length || ys[k] - ys[k - 1] > 2) { let sum = 0; for (let j = s; j < k; j++) sum += ys[j]; centers.push(sum / (k - s)); s = k; }
+      if (k === ys.length || ys[k] - ys[k - 1] > 2) { let sum = 0; for (let j = s; j < k; j++) sum += ys[j]; runs.push({ c: sum / (k - s), top: ys[s], bot: ys[k - 1] }); s = k; }
     }
-    return centers;
+    return runs;
   }
 
   // Follow a SINGLE trace across columns by CONTINUITY. At each column, among the vertical ink
@@ -289,17 +290,34 @@
   // at the apex and reject the whole following stretch of a real trace 13+ px away (the un-digitized
   // contraction down-slope). Safe because this drives only the single-trace TOCO panel. Falls back
   // to the plain dominant-run trace when there is no clean single-run anchor.
+  //
+  // APEX ENVELOPE: a NARROW upward spike (its steep up/down slopes fall into 1-2 columns) renders
+  // as a single vertical run spanning baseline->apex, so the run CENTRE undershoots the tip by half
+  // the spike height (e.g. a spike whose green ink runs y 218..258 reports the centre ~238 instead
+  // of the apex 218). When the chosen run is anomalously TALL (>> the trace's own linewidth) AND its
+  // top sits well above the running trajectory, we EMIT the run's top (apex) while keeping the
+  // continuity tracker `p` on the run centre. Decoupling the reported value from the tracker means
+  // the follower's trajectory never jumps to the tip, so a sustained steep slope (which is thin per
+  // column, not tall) is untouched and there is no oscillation -- only genuine narrow spikes climb.
   function traceFollow(mask, W, H, colLo, colHi, maxJump) {
     const n = colHi - colLo; if (n <= 0) return { cols: [], rows: [] };
-    const cc = new Array(n), single = [];
-    for (let i = 0; i < n; i++) { const cs = runCentersAt(mask, W, H, colLo + i); cc[i] = cs; if (cs.length === 1) single.push(cs[0]); }
+    const cc = new Array(n), single = [], widths = [];
+    for (let i = 0; i < n; i++) {
+      const cs = runsAt(mask, W, H, colLo + i); cc[i] = cs;
+      for (let j = 0; j < cs.length; j++) widths.push(cs[j].bot - cs[j].top + 1);
+      if (cs.length === 1) single.push(cs[0].c);
+    }
     if (single.length < 0.15 * n) return traceFromMask(mask, W, H, colLo, colHi);   // too few clean columns to anchor
+    const tall = Math.max(6, 3 * (median(widths) || 2));   // a run this tall is a narrow spike, not linewidth
     const seed = median(single);
     let aIdx = -1, aBest = Infinity, aCen = seed;
-    for (let i = 0; i < n; i++) if (cc[i].length === 1) { const dd = Math.abs(cc[i][0] - seed); if (dd < aBest) { aBest = dd; aIdx = i; aCen = cc[i][0]; } }
+    for (let i = 0; i < n; i++) if (cc[i].length === 1) { const dd = Math.abs(cc[i][0].c - seed); if (dd < aBest) { aBest = dd; aIdx = i; aCen = cc[i][0].c; } }
     const row = new Float64Array(n); row.fill(NaN); row[aIdx] = aCen;
     const LOST = 3;   // consecutive out-of-range columns (with runs) before re-anchoring
-    const nearest = function (prev, cs) { let best = cs[0], bd = Infinity; for (let j = 0; j < cs.length; j++) { const dd = Math.abs(cs[j] - prev); if (dd < bd) { bd = dd; best = cs[j]; } } return { c: best, d: bd }; };
+    const nearest = function (prev, cs) { let best = cs[0], bd = Infinity; for (let j = 0; j < cs.length; j++) { const dd = Math.abs(cs[j].c - prev); if (dd < bd) { bd = dd; best = cs[j]; } } return { run: best, d: bd }; };
+    // Reported row for a chosen run: its apex (top) if it is a tall run whose tip is well above the
+    // trajectory (a narrow upward spike), otherwise its centre.
+    const emit = function (run, p) { return (run.bot - run.top + 1 > tall && run.top < p - 0.5 * tall) ? run.top : run.c; };
     // one directional pass from the anchor; dir = +1 (rightward) or -1 (leftward). A run within
     // maxJump extends the trace; after LOST consecutive out-of-range columns the follower re-anchors
     // onto the current column's nearest run so a steep spike apex can't freeze it for the rest of the pass.
@@ -308,8 +326,8 @@
       for (let i = aIdx + dir; i >= 0 && i < n; i += dir) {
         if (!cc[i].length) continue;                       // no ink here: keep prev, bridge downstream
         const nr = nearest(p, cc[i]);
-        if (nr.d <= maxJump) { row[i] = nr.c; p = nr.c; miss = 0; }
-        else if (++miss >= LOST) { row[i] = nr.c; p = nr.c; miss = 0; }
+        if (nr.d <= maxJump) { row[i] = emit(nr.run, p); p = nr.run.c; miss = 0; }
+        else if (++miss >= LOST) { row[i] = emit(nr.run, p); p = nr.run.c; miss = 0; }
       }
     };
     walk(1); walk(-1);
@@ -735,31 +753,52 @@
     // at 180 bpm cannot really have points at 210. A real decel/contraction moves gradually,
     // so the rolling median tracks it and it survives. `floor` is the physiological minimum
     // deviation (bpm / TOCO units) tolerated, so a flat, tight baseline isn't over-trimmed.
-    function despike(cols, rows, conv, floor) {
+    // Is the sample at column `c`, apex row `ra`, the tip of an ink excursion CONNECTED down to the
+    // local baseline row `mr`? A genuine narrow spike renders as a continuous vertical ink run from
+    // its apex back down to (or near) the baseline trace; a DETACHED annotation mark (in-strip axis
+    // digit, event marker) floats off the trace with white above and below and never reaches the
+    // baseline. Walk down column `c` from the apex allowing 2 px gaps; the excursion is connected if
+    // that run gets within ~maxJump px of the baseline row. `mask`/W/H are closed over.
+    function connectedExcursion(mask, c, ra, mr) {
+      if (!mask) return false;
+      const a = Math.round(ra), b = Math.round(mr);
+      if (b - a < 4) return false;                     // not a real upward excursion
+      let gap = 0, reached = a;
+      for (let y = a; y <= b + 2 && y < H; y++) {
+        if (mask[y * W + c]) { gap = 0; reached = y; }
+        else if (++gap > 2) break;
+      }
+      return reached >= b - 12;                         // the run descends to near the baseline
+    }
+    function despike(cols, rows, conv, floor, mask) {
       const n = rows.length; if (n < 8) return { cols: cols, rows: rows };
       // Local Hampel window. It must be NARROWER than the narrowest genuine excursion (a contraction
       // or deceleration is tens of px wide) so the rolling median TRACKS the feature and its apex is
       // kept. A window as wide as the whole trace makes a sharp peak a minority of its own window, so
       // the median sits at baseline and the peak's tip is wrongly deleted as a "spike" -- the false
       // negatives seen at acceleration/contraction apexes. ~16 px still leaves an isolated annotation
-      // mark a small minority of the window, so stray text/arrow marks are still removed.
+      // mark a small minority of the window, so stray text/arrow marks are still removed. A flagged
+      // sample is nonetheless KEPT when `mask` is given and it is the tip of an excursion connected to
+      // the baseline (a genuine narrow spike, e.g. a sharp TOCO contraction) -- only DETACHED marks go.
       const half = Math.max(6, Math.min(16, n >> 2)), K = 4, val = new Array(n);
       for (let i = 0; i < n; i++) val[i] = conv(rows[i]);
-      const oc = [], orow = [], win = [], dev = [];
+      const oc = [], orow = [], win = [], dev = [], winR = [];
       for (let i = 0; i < n; i++) {
         const lo = Math.max(0, i - half), hi = Math.min(n - 1, i + half);
-        win.length = 0; for (let k = lo; k <= hi; k++) win.push(val[k]);
+        win.length = 0; winR.length = 0; for (let k = lo; k <= hi; k++) { win.push(val[k]); winR.push(rows[k]); }
         win.sort(function (a, b) { return a - b; });
-        const m = win[win.length >> 1];
+        winR.sort(function (a, b) { return a - b; });
+        const m = win[win.length >> 1], mr = winR[winR.length >> 1];
         dev.length = 0; for (let k = 0; k < win.length; k++) dev.push(Math.abs(win[k] - m));
         dev.sort(function (a, b) { return a - b; });
         const thr = Math.max(floor, K * 1.4826 * dev[dev.length >> 1]);   // MAD -> robust sigma
-        if (Math.abs(val[i] - m) <= thr) { oc.push(cols[i]); orow.push(rows[i]); }
+        const kept = Math.abs(val[i] - m) <= thr || connectedExcursion(mask, cols[i], rows[i], mr);
+        if (kept) { oc.push(cols[i]); orow.push(rows[i]); }
       }
       return { cols: oc, rows: orow };
     }
-    function addSeries(name, tr, conv, hue, floor, band) {
-      const ft = floor ? despike(tr.cols, tr.rows, conv, floor) : tr;
+    function addSeries(name, tr, conv, hue, floor, band, mask) {
+      const ft = floor ? despike(tr.cols, tr.rows, conv, floor, mask) : tr;
       const interp = new Array(ft.cols.length); for (let j = 0; j < interp.length; j++) interp[j] = false;   // measured (not interpolated)
       overlay[name] = { cols: ft.cols, rows: ft.rows, conv: conv, hue: hue || 0, band: band, interp: interp };
       present.push(name);
@@ -770,7 +809,7 @@
     const fhrBand = [ftLo, ftHi], tocoBand = [Math.max(0, Math.floor(boundary)), Math.min(H - 1, tocoRows[tocoRows.length - 1] + 4)];
     if (fhrOut[0]) addSeries("fhr", fhrOut[0].tr, to_fhr, fhrOut[0].hue, 12, fhrBand);
     if (fhrOut[1]) addSeries("mhr", fhrOut[1].tr, to_fhr, fhrOut[1].hue, 12, fhrBand);
-    if (tocoTrace.cols.length) addSeries("toco", tocoTrace, to_toco, meanHue(d, tocoInk), 18, tocoBand);
+    if (tocoTrace.cols.length) addSeries("toco", tocoTrace, to_toco, meanHue(d, tocoInk), 18, tocoBand, tocoInk);
     if (!present.length) throw new Error("no colored traces detected. Try a lower color sensitivity.");
 
     const sec_per_px = (end_min - o.start_min) * 60.0 / (x_right - x_left);
